@@ -7,30 +7,11 @@ use serde_derive::{Serialize, Deserialize};
 pub enum Page {
     #[default]
     Help,
-    Voice,
     Dco,
     Vcf,
     Adsr,
     Effect,
     Misc,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
-#[strum(serialize_all = "kebab-case")]
-pub enum Waveform {
-    // Juno DCO mix (saw / pulse / pulse width from the DCO page)
-    #[default]
-    Juno,
-    Saw,
-    Tri,
-    Sine,
-    Square,
-    Organ,
-    Pulse,
-    Comb,
-    Formant,
-    OvSine,
-    Strng,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -47,17 +28,6 @@ pub enum EnvPolarity {
     #[default]
     Pos,
     Neg,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
-#[strum(serialize_all = "kebab-case")]
-pub enum ProcMode {
-    #[default]
-    Off,
-    Sat,
-    Fold,
-    Rect,
-    Crush,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -106,8 +76,8 @@ impl MidiChannel {
 }
 
 int_params!(PageNumParams<u16>    { step: 1, min: 0, max: 0 });
-int_params!(ProcAmtParams<u16>   { step: 1, min: 0, max: 50, format: IntFormat::Scaled { divisor: 10, precision: 1, suffix: "" } });
 int_params!(DriveParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(LevelParams<u16>      { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(PwParams<u16>         { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(CutoffParams<u16>     { step: 512, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(EnvAmtParams<u16>     { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
@@ -117,8 +87,6 @@ int_params!(DiffuseParams<u16>    { step: 2048, min: 0, max: 32768, format: IntF
 int_params!(AdsrTimeParams<u16>  { step: 1024, min: 0, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
 int_params!(AdsrLevelParams<u16> { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(ScrollParams<u8>      { step: 1, min: 0, max: 125 });
-int_params!(LfoRateParams<u16>   { step: 2, min: 0, max: 50, format: IntFormat::Scaled { divisor: 10, precision: 1, suffix: "hz" } });
-int_params!(LfoDepthParams<u16>  { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 
 button_params!(OneShotButtonParams { mode: ButtonMode::OneShot });
 
@@ -128,23 +96,8 @@ pub struct HelpOpts {
     pub scroll: IntOption<ScrollParams>,
 }
 
-#[derive(OptionPage, Clone)]
-pub struct VoiceOpts {
-    #[option]
-    pub waveform: EnumOption<Waveform>,
-    #[option]
-    pub proc: EnumOption<ProcMode>,
-    #[option(10)]
-    pub proc_amt: IntOption<ProcAmtParams>,
-    #[option(1)]
-    pub lfo_rate: IntOption<LfoRateParams>,
-    #[option(3277)]
-    pub lfo_depth: IntOption<LfoDepthParams>,
-}
-
-// Juno-style DCO mixer, used by the `juno` waveform. Static pulse width only
-// (the wavetable is rewritten on change); sub / noise / PWM come with the
-// Phase 2 oscillator.
+// Juno DCO mixer (MultiJunoOsc): saw / pulse on-off, pulse width,
+// sub-oscillator and noise levels. All live (no table rewrite).
 #[derive(OptionPage, Clone)]
 pub struct DcoOpts {
     #[option(Switch::On)]
@@ -153,6 +106,10 @@ pub struct DcoOpts {
     pub pulse: EnumOption<Switch>,
     #[option(0)]
     pub pw: IntOption<PwParams>,
+    #[option(0)]
+    pub sub: IntOption<LevelParams>,
+    #[option(0)]
+    pub noise: IntOption<LevelParams>,
 }
 
 // Juno-style VCF: exponential cutoff (0..1 = 10 octaves, 12 Hz .. 12 kHz).
@@ -211,8 +168,6 @@ pub struct Opts {
     pub tracker: ScreenTracker<Page>,
     #[page(Page::Help)]
     pub help: HelpOpts,
-    #[page(Page::Voice)]
-    pub voice: VoiceOpts,
     #[page(Page::Dco)]
     pub dco: DcoOpts,
     #[page(Page::Vcf)]

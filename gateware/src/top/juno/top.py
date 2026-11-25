@@ -8,7 +8,7 @@
 
               Audio / CV
            ┌────┐
-           │in0 │◄─ phase modulation
+           │in0 │◄─ -
            │in1 │◄─ filter cutoff (1V/oct)
            │in2 │◄─ drive
            │in3 │◄─ -
@@ -31,12 +31,13 @@ supported, selected on the MISC page).
       mod wheel (computed per voice by firmware) + env amount x envelope + CV in1
       (1V/oct, computed per voice in gateware). The envelope also drives a per-voice VCA.
 
-    - When a jack is patched into input 0, 1 or 2, CV can be used to modulate
-      all voices simultaneously up to audio rate (phase mod, filter cutoff and
-      drive). Inputs 1 and 2 act as bipolar offsets on top of the existing
-      envelope / knob value. Patch an LFO into phase CV for retro 'tape-wow'
-      like detuning. Patch an oscillator into phase CV for FM effects, or into
-      drive for AM effect.
+    - Oscillator: Juno DCO per voice (curved saw, pulse with width, sub-oscillator
+      one octave down, shared noise), band-limited (PolyBLEP), mixed with the
+      DCO page settings.
+
+    - When a jack is patched into input 1 or 2, CV modulates all voices up to
+      audio rate (filter cutoff 1V/oct, drive as a bipolar offset). Input 0 is
+      unused for now (assignable CV inputs are planned).
 
 Each voice is hard panned left or right in the stereo field, with 2 end-of-chain
 effects: distortion and diffusion (delay), both of which can be mixed in with
@@ -72,12 +73,6 @@ the UI.
                                   │OUT (4x)├──────► out2 (L)
                                   └────────┴──────► out3 (R)
 
-The VOICE page allows selection between many wavetables. The 'proc' option
-allows applying effects (e.g. saturation, wavefolding, rectify) to
-the wavetable **before** it hits the voice filter. When no CV is patched
-into input 0, a built-in sine LFO modulates the phase of all voices
-(rate and depth are adjustable on the VOICE page).
-
 If a MIDI clock is present on TRS or USB MIDI, it is divided by 24 (1PPQN)
 and sent out on output jack 1. STOP/START/CONTINUE is respected. The LED
 will pulse with the clock ONLY if that jack is connected.
@@ -91,21 +86,18 @@ can also be used to control most of these through CCs as follows:
         ────    ─────────     ──  ───────────
         HELP    scroll         -  scroll help text up/down
 
-        VOICE   waveform      20  wavetable selection (`juno` = DCO page mix)
-        VOICE   proc          21  wavetable processing mode
-        VOICE   proc-amt      22  wavetable processing amount
 
         DCO     saw           17  saw on/off (Juno curved ramp)
         DCO     pulse         18  pulse on/off
         DCO     pw            19  pulse width (0 = square .. narrow)
+        DCO     sub           20  sub-oscillator level
+        DCO     noise         21  noise level
 
         VCF     cutoff        26  filter cutoff (exponential)
         VCF     reso          23  filter resonance
         VCF     env-amt       27  envelope -> cutoff amount
         VCF     env-pol       28  envelope polarity (+/-)
         VCF     kbd-track     29  keyboard tracking (0 = off, 1 = 100 %)
-        VOICE   lfo-rate      24  phase modulation LFO rate
-        VOICE   lfo-depth     25  phase modulation LFO depth
 
         ADSR    attack        30  envelope attack (VCF + VCA)
         ADSR    decay         31  envelope decay
@@ -204,12 +196,13 @@ class PolySynth(wiring.Component):
     sustain_level: In(MultiADSR.EnvUQ)
     release_rate: In(MultiADSR.EnvUQ)
 
-    # Wavetable write port (firmware fills via CSR)
-    wt_write_addr: In(unsigned(9))
-    wt_write_data: In(signed(16))
-    wt_write_en: In(unsigned(1))
+    # Juno DCO mixer (global)
+    saw_en: In(1)
+    pulse_en: In(1)
+    pw_point: In(unsigned(16))
+    sub_gain: In(unsigned(16))
+    noise_gain: In(unsigned(16))
 
-    lfo: In(ASQ)
 
     # Jack detection (directly from pmod hardware)
     jack: In(unsigned(8))
@@ -246,17 +239,7 @@ class PolySynth(wiring.Component):
         with m.If(self.i.valid):
             m.d.sync += cv.eq(self.i.payload)
 
-        m.submodules.lfo_lpf = lfo_lpf = dsp.OnePole()
-        m.d.comb += [
-            lfo_lpf.i.payload.eq(self.lfo),
-            lfo_lpf.i.valid.eq(self.i.valid),
-            lfo_lpf.o.ready.eq(1),
-            lfo_lpf.shift.eq(6),
-        ]
-
-        # CV 0: phase modulation (when jack 0 patched, otherwise use LFO)
-        m.d.comb += voice_block.phase_mod.eq(
-            Mux(self.jack[0], cv[0], lfo_lpf.o.payload))
+        # CV 0: unused for now (phase modulation removed with the wavetable oscillator)
 
         # CV 2: drive bipolar offset (when jack 2 patched)
         SQDrive = dsp.mac.SQNative  # SQ(3, 15)
@@ -296,9 +279,11 @@ class PolySynth(wiring.Component):
             voice_block.decay_rate.eq(self.decay_rate),
             voice_block.sustain_level.eq(self.sustain_level),
             voice_block.release_rate.eq(self.release_rate),
-            voice_block.wt_write_addr.eq(self.wt_write_addr),
-            voice_block.wt_write_data.eq(self.wt_write_data),
-            voice_block.wt_write_en.eq(self.wt_write_en),
+            voice_block.saw_en.eq(self.saw_en),
+            voice_block.pulse_en.eq(self.pulse_en),
+            voice_block.pw_point.eq(self.pw_point),
+            voice_block.sub_gain.eq(self.sub_gain),
+            voice_block.noise_gain.eq(self.noise_gain),
         ]
 
         # Output diffuser
@@ -371,14 +356,16 @@ class SynthPeripheral(wiring.Component):
     class ReleaseRate(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
 
-    class Lfo(csr.Register, access="w"):
-        value: csr.Field(csr.action.W, signed(16))
+    class Dco(csr.Register, access="w"):
+        saw:   csr.Field(csr.action.W, unsigned(1))
+        pulse: csr.Field(csr.action.W, unsigned(1))
 
-    class WavetableAddr(csr.Register, access="w"):
+    class PwPoint(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
 
-    class WavetableData(csr.Register, access="w"):
-        value: csr.Field(csr.action.W, signed(16))
+    class MixLevels(csr.Register, access="w"):
+        sub:   csr.Field(csr.action.W, unsigned(16))
+        noise: csr.Field(csr.action.W, unsigned(16))
 
     class EnvAmt(csr.Register, access="w"):
         value: csr.Field(csr.action.W, signed(16))
@@ -437,9 +424,10 @@ class SynthPeripheral(wiring.Component):
         self._decay_rate    = regs.add("decay_rate",    self.DecayRate(),     offset=voices_csr_end + 0x20)
         self._sustain_level = regs.add("sustain_level", self.SustainLevel(),  offset=voices_csr_end + 0x24)
         self._release_rate  = regs.add("release_rate",  self.ReleaseRate(),   offset=voices_csr_end + 0x28)
-        self._wt_addr       = regs.add("wt_addr",       self.WavetableAddr(), offset=voices_csr_end + 0x2C)
-        self._wt_data       = regs.add("wt_data",       self.WavetableData(), offset=voices_csr_end + 0x30)
-        self._lfo           = regs.add("lfo",           self.Lfo(),           offset=voices_csr_end + 0x34)
+        # 0x2C..0x34 were wavetable addr/data + LFO (removed with the wavetable oscillator)
+        self._dco           = regs.add("dco",           self.Dco(),           offset=voices_csr_end + 0x2C)
+        self._pw_point      = regs.add("pw_point",      self.PwPoint(),       offset=voices_csr_end + 0x30)
+        self._mix_levels    = regs.add("mix_levels",    self.MixLevels(),     offset=voices_csr_end + 0x34)
         self._midi_ch_filt  = regs.add("midi_ch_filter",self.MidiChannelFilter(), offset=voices_csr_end + 0x38)
         self._env_amt       = regs.add("env_amt",       self.EnvAmt(),        offset=voices_csr_end + 0x3C)
         self._cutoff_base   = [regs.add(f"cutoff_base{i}", self.CutoffBase(),
@@ -480,18 +468,19 @@ class SynthPeripheral(wiring.Component):
         with m.If(self._release_rate.f.value.w_stb):
             m.d.sync += self.synth.release_rate.eq(self._release_rate.f.value.w_data)
 
-        with m.If(self._lfo.f.value.w_stb):
-            m.d.sync += self.synth.lfo.as_value().eq(self._lfo.f.value.w_data)
-
-        # Wavetable write: latch address on addr write, commit on data write
-        wt_addr_reg = Signal(9)
-        with m.If(self._wt_addr.f.value.w_stb):
-            m.d.sync += wt_addr_reg.eq(self._wt_addr.f.value.w_data[:9])
-        m.d.comb += [
-            self.synth.wt_write_addr.eq(wt_addr_reg),
-            self.synth.wt_write_data.eq(self._wt_data.f.value.w_data),
-            self.synth.wt_write_en.eq(self._wt_data.f.value.w_stb),
-        ]
+        # Juno DCO mixer
+        with m.If(self._dco.element.w_stb):
+            m.d.sync += [
+                self.synth.saw_en.eq(self._dco.f.saw.w_data),
+                self.synth.pulse_en.eq(self._dco.f.pulse.w_data),
+            ]
+        with m.If(self._pw_point.f.value.w_stb):
+            m.d.sync += self.synth.pw_point.eq(self._pw_point.f.value.w_data)
+        with m.If(self._mix_levels.element.w_stb):
+            m.d.sync += [
+                self.synth.sub_gain.eq(self._mix_levels.f.sub.w_data),
+                self.synth.noise_gain.eq(self._mix_levels.f.noise.w_data),
+            ]
 
         # USB MIDI flags
         with m.If(self._midi_host.f.host.w_stb):
@@ -568,7 +557,7 @@ class PolySoc(TiliquaSoc):
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
         brief="MIDI Polysynth (6-voice, Juno WIP)",
-        io_left=['phase cv', 'filter cv', 'drive cv', '', '', 'clk', 'out L', 'out R'],
+        io_left=['', 'filter cv', 'drive cv', '', '', 'clk', 'out L', 'out R'],
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 

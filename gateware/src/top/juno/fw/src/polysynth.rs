@@ -87,13 +87,19 @@ impl Polysynth0 {
         self.registers.release_rate().write(|w| unsafe { w.value().bits(value) } );
     }
 
-    pub fn set_lfo(&mut self, value: i16)  {
-        self.registers.lfo().write(|w| unsafe { w.value().bits(value as u16) } );
+    /// Juno DCO mixer switches.
+    pub fn set_dco(&mut self, saw: bool, pulse: bool)  {
+        self.registers.dco().write(|w| w.saw().bit(saw).pulse().bit(pulse) );
     }
 
-    pub fn write_wavetable_sample(&mut self, addr: u16, data: i16)  {
-        self.registers.wt_addr().write(|w| unsafe { w.value().bits(addr) } );
-        self.registers.wt_data().write(|w| unsafe { w.value().bits(data as u16) } );
+    /// Pulse rising-edge phase, UQ(0,16) (see dco::pw_knob_to_point).
+    pub fn set_pw_point(&mut self, value: u16)  {
+        self.registers.pw_point().write(|w| unsafe { w.value().bits(value) } );
+    }
+
+    /// Sub-oscillator and noise gains, UQ(0,16).
+    pub fn set_mix_levels(&mut self, sub: u16, noise: u16)  {
+        self.registers.mix_levels().write(|w| unsafe { w.sub().bits(sub).noise().bits(noise) } );
     }
 
     pub fn midi_write(&mut self, value: u32)  {

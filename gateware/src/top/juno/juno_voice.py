@@ -28,7 +28,7 @@ solve...
 
     .. code-block:: text
 
-        MultiWavetableOsc ──┐
+        MultiJunoOsc ───────┐
                             ├── BlockMerge ──> MultiSVF (and DC block) ──> VoiceMixer
         MultiADSR ──────────┘
 """
@@ -202,132 +202,269 @@ class PitchToInc(wiring.Component):
         return m
 
 
-class MultiWavetableOsc(wiring.Component):
+class MultiJunoOsc(wiring.Component):
 
     """
-    N wavetable oscillators with:
-    - Per-voice log-domain pitch input (``PitchToInc``), 32-bit phase accumulator
-    - Global phase modulation (up to audio rate)
-    - Linear interpolation between wavetable samples
+    N Juno DCOs (Juno port): curved saw, pulse, sub-oscillator and shared noise
+    with the Juno mixer, band-limited with 2-point PolyBLEP.
+
+    Bit-exact with ``top.juno.osc_model.OscModel`` (see there for the algorithm).
+    Pitch per voice in semitones (``PitchToInc``); mixer settings are global:
+    ``saw_en``, ``pulse_en``, ``pw_point`` (UQ(0,16) phase of the pulse rising edge),
+    ``sub_gain`` and ``noise_gain`` (UQ(0,16)).
+
+    One ``PipelinedMAC`` for 6 multiplies per voice, plus a 16-cycle restoring
+    divider used twice per voice (~70 cycles per voice).
 
     Free-running: sample rate is determined by backpressure on ``self.o``.
     """
 
-    def __init__(self, n, wt_size=512, sq=ASQ):
+    DIV_BITS = 16
+    LFSR_TAPS = 0x80200003
+    LFSR_SEED = 0xACE1ACE1
+    CURVE = 4915        # 0.15 * 2**15
+    ONE = 1 << 15
+
+    def __init__(self, n, sq=ASQ):
         self.n = n
-        self.wt_size = wt_size
         self.sq = sq
         super().__init__({
-            # Pitch input (per-voice), semitones (see PitchToInc)
-            "voice_pitch":     In(data.ArrayLayout(PitchToInc.PitchSQ, n)),
-            # Phase modulation (all voices) for CV FM up to audio rate
-            "phase_mod":       In(sq),
-            # Wavetable memory access (to expose to SoC)
-            "wt_write_addr":   In(unsigned(exact_log2(wt_size))),
-            "wt_write_data":   In(signed(sq.i_bits + sq.f_bits)),
-            "wt_write_en":     In(1),
-            # Samples out
+            "voice_pitch": In(data.ArrayLayout(PitchToInc.PitchSQ, n)),
+            "saw_en":      In(1),
+            "pulse_en":    In(1),
+            "pw_point":    In(unsigned(16)),
+            "sub_gain":    In(unsigned(16)),
+            "noise_gain":  In(unsigned(16)),
             "o": Out(stream.Signature(Block(sq))),
         })
 
     def elaborate(self, platform):
         m = Module()
         N = self.n
-        WT_SIZE = self.wt_size
-        WT_BITS = exact_log2(WT_SIZE)
-        FRAC_BITS = 8
+        ONE = self.ONE
+        W = 20  # internal signed width for 15-bit fixed point audio values
 
-        # Wavetable memory
-
-        wt_sample_bits = self.sq.i_bits + self.sq.f_bits
-        m.submodules.wt_mem = wt_mem = Memory(
-            shape=signed(wt_sample_bits), depth=WT_SIZE, init=[0]*WT_SIZE)
-        wt_rport = wt_mem.read_port()
-        wt_wport = wt_mem.write_port()
-        m.d.comb += [
-            wt_rport.en.eq(1),
-            wt_wport.addr.eq(self.wt_write_addr),
-            wt_wport.data.eq(self.wt_write_data),
-            wt_wport.en.eq(self.wt_write_en),
-        ]
-
-        # Per-voice phase memory: UQ(0, 32) fraction of a cycle
-
-        m.submodules.state_mem = state_mem = Memory(
-            shape=unsigned(32), depth=N, init=[])
+        state_layout = data.StructLayout({
+            "phase":  unsigned(32),
+            "sub":    unsigned(1),
+            "sub_lp": signed(W),
+        })
+        m.submodules.state_mem = state_mem = Memory(shape=state_layout, depth=N, init=[])
         st_rport = state_mem.read_port()
         st_wport = state_mem.write_port()
         m.d.comb += st_rport.en.eq(1)
 
         m.submodules.pitch2inc = p2i = PitchToInc()
+        m.submodules.macp = mp = PipelinedMAC()
 
-        # Registers across all voices
-
-        cur_phase = Signal(32)
-        cur_pitch = Signal(PitchToInc.PitchSQ)
-        wt_sample = Signal(self.sq)
-        read0 = Signal(self.sq)
-        read1 = Signal(self.sq)
-        voice_ix = Signal(range(N))
+        voice_ix   = Signal(range(N))
+        cur_pitch  = Signal(PitchToInc.PitchSQ)
         pitch_wait = Signal(range(PitchToInc.LATENCY + 1))
-
         m.d.comb += p2i.pitch.eq(cur_pitch)
 
-        # Phase-modulated 'final phase' for wavetable lookup: phase_mod +-1.0 = +-0.5 cycle
-        mod_pos = Signal(32)
-        m.d.comb += mod_pos.eq(cur_phase + (self.phase_mod.as_value() << 16))
-        wt_index = mod_pos[32 - WT_BITS:]
-        frac = Signal(fixed.UQ(0, FRAC_BITS))
-        m.d.comb += frac.as_value().eq(mod_pos[32 - WT_BITS - FRAC_BITS:32 - WT_BITS])
+        phase   = Signal(32)
+        sub     = Signal(1)
+        sub_lp  = Signal(signed(W))
+        inc     = Signal(32)
+        t       = Signal(32)
+
+        # shared noise
+        lfsr     = Signal(32, init=self.LFSR_SEED)
+        noise_lp = Signal(signed(W))
+
+        # PolyBLEP bookkeeping
+        w_point   = Signal(32)
+        wrap_near = Signal()
+        wrap_after = Signal()
+        d_wrap    = Signal(32)
+        pw_near   = Signal()
+        pw_after  = Signal()
+        d_pw      = Signal(32)
+        c_w       = Signal(signed(W))
+        c_p       = Signal(signed(W))
+
+        # restoring divider: q = floor(num * 2**16 / den), num < den
+        div_rem = Signal(34)
+        div_q   = Signal(self.DIV_BITS)
+        div_cnt = Signal(range(self.DIV_BITS + 1))
+
+        # MAC operands (held until valid) and helpers
+        mac_a = Signal(mac.SQNative)
+        mac_b = Signal(mac.SQNative)
+        mac_z = Signal(signed(40))
+        m.d.comb += mac_z.eq(mp.result.z.as_value() >> 15)
+
+        p_lin  = Signal(signed(W))
+        q_curv = Signal(signed(W))
+        ramp   = Signal(signed(W))
+        saw    = Signal(signed(W))
+        pulse  = Signal(signed(W))
+        acc    = Signal(signed(W + 2))
+        out    = Signal(signed(16))
+
+        def corr(near, after, c, after_sign):
+            """+-c (after_sign for 'after the edge', opposite before), 0 if not near."""
+            v = Signal(signed(W))
+            with m.If(near):
+                with m.If(after):
+                    m.d.comb += v.eq(c if after_sign > 0 else -c)
+                with m.Else():
+                    m.d.comb += v.eq(-c if after_sign > 0 else c)
+            return v
+
+        corr_wrap = corr(wrap_near, wrap_after, c_w, +1)   # saw reset / pulse fall
+        corr_pw   = corr(pw_near, pw_after, c_p, -1)       # pulse rise
 
         with m.FSM():
 
             with m.State('LOAD'):
                 m.d.comb += st_rport.addr.eq(voice_ix)
-                m.next = 'LATCH-STATE'
+                m.next = 'LATCH'
 
-            with m.State('LATCH-STATE'):
+            with m.State('LATCH'):
                 m.d.sync += [
-                    cur_phase.eq(st_rport.data),
+                    phase.eq(st_rport.data.phase),
+                    sub.eq(st_rport.data.sub),
+                    sub_lp.eq(st_rport.data.sub_lp),
                     pitch_wait.eq(0),
+                    w_point.eq(self.pw_point << 16),
                 ]
                 with m.Switch(voice_ix):
                     for n in range(N):
                         with m.Case(n):
                             m.d.sync += cur_pitch.eq(self.voice_pitch[n])
+                with m.If(voice_ix == 0):
+                    # shared noise: advance once per frame, one-pole tilt
+                    nxt = Signal(32)
+                    with m.If(lfsr[0]):
+                        m.d.comb += nxt.eq((lfsr >> 1) ^ self.LFSR_TAPS)
+                    with m.Else():
+                        m.d.comb += nxt.eq(lfsr >> 1)
+                    n16 = nxt[16:32].as_signed()
+                    m.d.sync += [
+                        lfsr.eq(nxt),
+                        noise_lp.eq(noise_lp + ((n16 - noise_lp) >> 1)),
+                    ]
                 m.next = 'PITCH-WAIT'
 
             with m.State('PITCH-WAIT'):
-                # PitchToInc has a fixed latency; cur_pitch is held stable meanwhile
                 m.d.sync += pitch_wait.eq(pitch_wait + 1)
                 with m.If(pitch_wait == PitchToInc.LATENCY - 1):
-                    m.next = 'PHASE-ADVANCE'
+                    m.next = 'ADVANCE'
 
-            with m.State('PHASE-ADVANCE'):
-                m.d.sync += cur_phase.eq(cur_phase + p2i.inc)  # wraps at 2**32
-                m.next = 'WT-ADDR0'
+            with m.State('ADVANCE'):
+                t_full = Signal(33)
+                t_new = Signal(32)
+                m.d.comb += [
+                    t_full.eq(phase + p2i.inc),
+                    t_new.eq(t_full[:32]),
+                ]
+                inv_t = Signal(33)
+                m.d.comb += inv_t.eq((1 << 32) - t_new)
+                m.d.sync += [
+                    inc.eq(p2i.inc),
+                    t.eq(t_new),
+                    phase.eq(t_new),
+                    sub.eq(sub ^ t_full[32]),
+                    # wrap edge
+                    wrap_after.eq(t_new < p2i.inc),
+                    wrap_near.eq((t_new < p2i.inc) | (inv_t < p2i.inc)),
+                    d_wrap.eq(Mux(t_new < p2i.inc, t_new, inv_t)),
+                    # pulse rising edge
+                    pw_after.eq(t_new >= w_point),
+                    pw_near.eq(Mux(t_new >= w_point,
+                                   (t_new - w_point) < p2i.inc,
+                                   (w_point - t_new) < p2i.inc)),
+                    d_pw.eq(Mux(t_new >= w_point, t_new - w_point, w_point - t_new)),
+                ]
+                m.next = 'DIV-W-INIT'
 
-            with m.State('WT-ADDR0'):
-                m.d.comb += wt_rport.addr.eq(wt_index + 1)
-                m.next = 'WT-READ0'
+            # --- PolyBLEP for the wrap edge ---------------------------------
+            with m.State('DIV-W-INIT'):
+                m.d.sync += [div_rem.eq(d_wrap), div_q.eq(0), div_cnt.eq(0)]
+                m.next = 'DIV-W'
 
-            with m.State('WT-READ0'):
-                m.d.sync += read0.eq(wt_rport.data)
-                m.d.comb += wt_rport.addr.eq(wt_index)
-                m.next = 'WT-READ1'
+            with m.State('DIV-W'):
+                self._div_step(m, div_rem, div_q, div_cnt, inc, 'SQ-W')
 
-            with m.State('WT-READ1'):
-                m.d.sync += read1.eq(wt_rport.data)
-                m.next = 'INTERP'
+            with m.State('SQ-W'):
+                om = ((1 << self.DIV_BITS) - div_q) >> 1
+                m.d.comb += [mac_a.as_value().eq(om), mac_b.as_value().eq(om)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    m.d.sync += c_w.eq(Mux(wrap_near, mac_z, 0))
+                    m.next = 'DIV-P-INIT'
 
-            with m.State('INTERP'):
-                m.d.sync += wt_sample.eq(read1 + (read0 - read1) * frac)
-                m.next = 'STORE'
+            # --- PolyBLEP for the pulse rising edge --------------------------
+            with m.State('DIV-P-INIT'):
+                m.d.sync += [div_rem.eq(d_pw), div_q.eq(0), div_cnt.eq(0)]
+                m.next = 'DIV-P'
+
+            with m.State('DIV-P'):
+                self._div_step(m, div_rem, div_q, div_cnt, inc, 'SQ-P')
+
+            with m.State('SQ-P'):
+                om = ((1 << self.DIV_BITS) - div_q) >> 1
+                m.d.comb += [mac_a.as_value().eq(om), mac_b.as_value().eq(om)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    m.d.sync += [
+                        c_p.eq(Mux(pw_near, mac_z, 0)),
+                        p_lin.eq(t >> 17),
+                    ]
+                    m.next = 'CURVE-1'
+
+            # --- curved saw: ramp = p + 0.15 p (1 - p) -----------------------
+            with m.State('CURVE-1'):
+                m.d.comb += [mac_a.as_value().eq(p_lin), mac_b.as_value().eq(ONE - p_lin)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    m.d.sync += q_curv.eq(mac_z)
+                    m.next = 'CURVE-2'
+
+            with m.State('CURVE-2'):
+                m.d.comb += [mac_a.as_value().eq(q_curv), mac_b.as_value().eq(self.CURVE)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    m.d.sync += ramp.eq(p_lin + mac_z)
+                    m.next = 'SHAPE'
+
+            with m.State('SHAPE'):
+                sub_x = Signal(signed(W))
+                m.d.comb += sub_x.eq(Mux(sub, ONE - c_w, -ONE + c_w))
+                m.d.sync += [
+                    saw.eq(2 * ramp - ONE + corr_wrap),
+                    pulse.eq(Mux(t >= w_point, ONE, -ONE) + corr_wrap + corr_pw),
+                    sub_lp.eq(sub_lp + ((sub_x - sub_lp) >> 1)),
+                ]
+                m.next = 'MIX-SUB'
+
+            # --- mixer --------------------------------------------------------
+            with m.State('MIX-SUB'):
+                m.d.comb += [mac_a.as_value().eq(sub_lp),
+                             mac_b.as_value().eq(self.sub_gain >> 1)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    m.d.sync += acc.eq(
+                        Mux(self.saw_en, saw >> 1, 0) +
+                        Mux(self.pulse_en, pulse >> 1, 0) +
+                        mac_z)
+                    m.next = 'MIX-NOISE'
+
+            with m.State('MIX-NOISE'):
+                m.d.comb += [mac_a.as_value().eq(noise_lp),
+                             mac_b.as_value().eq(self.noise_gain >> 1)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    total = acc + mac_z
+                    with m.If(total > ONE - 1):
+                        m.d.sync += out.eq(ONE - 1)
+                    with m.Elif(total < -ONE):
+                        m.d.sync += out.eq(-ONE)
+                    with m.Else():
+                        m.d.sync += out.eq(total)
+                    m.next = 'STORE'
 
             with m.State('STORE'):
                 m.d.comb += [
                     st_wport.addr.eq(voice_ix),
-                    st_wport.data.eq(cur_phase),
+                    st_wport.data.phase.eq(phase),
+                    st_wport.data.sub.eq(sub),
+                    st_wport.data.sub_lp.eq(sub_lp),
                     st_wport.en.eq(1),
                 ]
                 m.next = 'EMIT'
@@ -335,18 +472,29 @@ class MultiWavetableOsc(wiring.Component):
             with m.State('EMIT'):
                 m.d.comb += [
                     self.o.valid.eq(1),
-                    self.o.payload.sample.eq(wt_sample),
+                    self.o.payload.sample.as_value().eq(out),
                     self.o.payload.first.eq(voice_ix == 0),
                 ]
                 with m.If(self.o.ready):
                     with m.If(voice_ix == N - 1):
                         m.d.sync += voice_ix.eq(0)
-                        m.next = 'LOAD'
                     with m.Else():
                         m.d.sync += voice_ix.eq(voice_ix + 1)
-                        m.next = 'LOAD'
+                    m.next = 'LOAD'
 
         return m
+
+    def _div_step(self, m, rem, q, cnt, den, next_state):
+        """One iteration of the restoring divider per cycle."""
+        shifted = Signal(34, name=f"div_shift_{next_state.lower().replace('-', '_')}")
+        m.d.comb += shifted.eq(rem << 1)
+        with m.If(shifted >= den):
+            m.d.sync += [rem.eq(shifted - den), q.eq((q << 1) | 1)]
+        with m.Else():
+            m.d.sync += [rem.eq(shifted), q.eq(q << 1)]
+        m.d.sync += cnt.eq(cnt + 1)
+        with m.If(cnt == self.DIV_BITS - 1):
+            m.next = next_state
 
 
 class MultiADSR(wiring.Component):
@@ -834,8 +982,6 @@ class VoiceMixer(wiring.Component):
 
 class JunoVoice(wiring.Component):
 
-    WAVETABLE_SIZE = 512
-
     def __init__(self, n_voices, sq=ASQ):
         self.n_voices = n_voices
         self.sq = sq
@@ -861,13 +1007,12 @@ class JunoVoice(wiring.Component):
             "sustain_level":  In(MultiADSR.EnvUQ),
             "release_rate":   In(MultiADSR.EnvUQ),
 
-            # Wavetable write port (firmware fills via CSR)
-            "wt_write_addr":  In(unsigned(exact_log2(self.WAVETABLE_SIZE))),
-            "wt_write_data":  In(signed(sq.i_bits + sq.f_bits)),
-            "wt_write_en":    In(1),
-
-            # Phase modulation input (applied to all oscillators)
-            "phase_mod":      In(sq),
+            # Juno DCO mixer (global, see MultiJunoOsc)
+            "saw_en":         In(1),
+            "pulse_en":       In(1),
+            "pw_point":       In(unsigned(16)),
+            "sub_gain":       In(unsigned(16)),
+            "noise_gain":     In(unsigned(16)),
 
             # Per-voice ADSR idle status
             "voice_active":   Out(data.ArrayLayout(unsigned(1), self.n_voices)),
@@ -882,7 +1027,7 @@ class JunoVoice(wiring.Component):
         N = self.n_voices
 
         sq = self.sq
-        m.submodules.osc = osc = MultiWavetableOsc(n=N, wt_size=self.WAVETABLE_SIZE, sq=sq)
+        m.submodules.osc = osc = MultiJunoOsc(n=N, sq=sq)
         m.submodules.adsr = adsr = MultiADSR(n=N)
         m.submodules.merge = merge = BlockMerge({"x": sq, "env": MultiADSR.EnvUQ})
         # Pipelined multiplier: keeps the 60 MHz domain clear of the SVF MAC path
@@ -899,10 +1044,11 @@ class JunoVoice(wiring.Component):
                 svf.voice_cutoff_base[n].eq(self.voice_cutoff_base[n]),
             ]
         m.d.comb += [
-            osc.wt_write_addr.eq(self.wt_write_addr),
-            osc.wt_write_data.eq(self.wt_write_data),
-            osc.wt_write_en.eq(self.wt_write_en),
-            osc.phase_mod.eq(self.phase_mod),
+            osc.saw_en.eq(self.saw_en),
+            osc.pulse_en.eq(self.pulse_en),
+            osc.pw_point.eq(self.pw_point),
+            osc.sub_gain.eq(self.sub_gain),
+            osc.noise_gain.eq(self.noise_gain),
             adsr.attack_rate.eq(self.attack_rate),
             adsr.decay_rate.eq(self.decay_rate),
             adsr.sustain_level.eq(self.sustain_level),

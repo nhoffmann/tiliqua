@@ -18,8 +18,10 @@ from amaranth.sim import Simulator
 
 from amaranth_future import fixed
 
-from top.juno.juno_voice import MultiSVF, PitchToInc
-from top.juno.sim_render import FS, Note, Params, juno_table, render
+from top.juno.juno_voice import MultiJunoOsc, MultiSVF, PitchToInc
+from top.juno.osc_model import OscModel
+from tiliqua.test import stream
+from top.juno.sim_render import FS, Note, Params, pw_knob_to_point, render
 
 
 def rms(x):
@@ -101,6 +103,42 @@ class JunoVoiceTests(unittest.TestCase):
             if 0 <= raw < 128 * 1024:
                 cents = 1200 * np.log2(got / PitchToInc.exact_inc(raw / 1024))
                 self.assertLess(abs(cents), 0.01, f"pitch raw {raw}")
+
+    def test_juno_osc_matches_model(self):
+        """MultiJunoOsc gateware is bit-exact with osc_model.OscModel: 3 voices at
+        low / mid / very high pitch (PolyBLEP regions overlap a lot at the top),
+        all mixer sources on, pulse width away from square."""
+        n_voices = 3
+        pitches = [36.0, 61.37, 115.0]
+        cfg = dict(saw_en=1, pulse_en=1, pw_point=int(0.7 * 65536),
+                   sub_gain=int(0.67 * 65535), noise_gain=int(0.3 * 65535))
+        n_frames = 400
+        m = Module()
+        m.submodules.dut = dut = MultiJunoOsc(n=n_voices)
+        got = []
+
+        async def testbench(ctx):
+            for k, v in cfg.items():
+                ctx.set(getattr(dut, k), v)
+            for v, ptch in enumerate(pitches):
+                ctx.set(dut.voice_pitch[v], fixed.Const(ptch, shape=PitchToInc.PitchSQ))
+            for _ in range(n_frames * n_voices):
+                got.append(round((await stream.get(ctx, dut.o)).sample.as_float() * 32768))
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+        model = OscModel(n_voices)
+        incs = [PitchToInc.model(round(ptch * 1024)) for ptch in pitches]
+        expected = [model.voice(v, incs[v], **cfg)
+                    for _ in range(n_frames) for v in range(n_voices)]
+        mismatches = [i for i, (a, b) in enumerate(zip(got, expected)) if a != b]
+        self.assertEqual(mismatches[:5], [], f"first mismatch at sample {mismatches[:1]}: "
+                         f"got {[got[i] for i in mismatches[:3]]}, "
+                         f"expected {[expected[i] for i in mismatches[:3]]}")
+        self.assertGreater(np.std(got), 1000)   # not silent
 
     def test_pitch_bend(self):
         """Pitch bend is exact in the log domain: +2 semitones on A4 -> B4."""
@@ -186,25 +224,58 @@ class JunoVoiceTests(unittest.TestCase):
         via_knob = self._centroid(cutoff=0.5, env_amt=0.0, kbd=0.0)
         self.assertAlmostEqual(via_cv / via_knob, 1.0, delta=0.03)
 
-    # --- Juno DCO wavetable (mirror of the firmware generator) -------------------
+    # --- Juno DCO (MultiJunoOsc; the model is bit-exact with the gateware) ---
 
-    def test_juno_table_shape(self):
-        """Curved saw: rises monotonically from -1 to ~+1 and bows upward
-        (mid-cycle above 0). Pulse duty: ~54 % at pw=0, ~4.5 % at pw=1 (matches the Rust generator)."""
-        saw = np.array(juno_table(True, False)) / 32768
-        self.assertTrue(np.all(np.diff(saw) > 0))
-        self.assertAlmostEqual(saw[0], -1.0, delta=0.01)
-        self.assertGreater(saw[-1], 0.99)
-        self.assertAlmostEqual(saw[len(saw) // 2], 0.075, delta=0.01)
-        for pw, duty in [(0.0, 0.537), (1.0, 0.045)]:
-            pulse = np.array(juno_table(False, True, pw))
-            self.assertAlmostEqual(np.mean(pulse > 0), duty, delta=0.01)
+    @staticmethod
+    def _osc(note, n=16384, **cfg):
+        base = dict(saw_en=0, pulse_en=0, pw_point=0, sub_gain=0, noise_gain=0)
+        model = OscModel(1)
+        inc = PitchToInc.model(note * 1024)
+        return np.array([model.voice(0, inc, **{**base, **cfg}) for _ in range(n)]) / 32768
+
+    def test_pw_knob_mapping(self):
+        """PW knob 0 -> ~54 % duty (near square), knob 1 -> ~4.5 % (as in Phase 1b)."""
+        for knob, duty in [(0.0, 0.537), (1.0, 0.045)]:
+            x = self._osc(60, pulse_en=1, pw_point=pw_knob_to_point(knob))
+            self.assertAlmostEqual(np.mean(x > 0), duty, delta=0.01)
+
+    def test_polyblep_reduces_aliasing(self):
+        """C7 saw: PolyBLEP cuts non-harmonic (aliased) energy by > 10 dB vs naive."""
+        note = 96
+        f0 = 440.0 * 2 ** ((note - 69) / 12)
+        def alias_db(x):
+            x = (x - x.mean()) * np.blackman(len(x))
+            P = np.abs(np.fft.rfft(x)) ** 2
+            f = np.fft.rfftfreq(len(x), 1 / FS)
+            h = np.zeros_like(P, bool)
+            for k in range(1, int(FS / 2 / f0) + 1):
+                h |= np.abs(f - k * f0) < f0 * 0.03
+            return 10 * np.log10(P[~h].sum() / P[h].sum())
+        blep = self._osc(note, saw_en=1)
+        inc, ph, naive = PitchToInc.model(note * 1024), 0, []
+        for _ in range(len(blep)):
+            ph = (ph + inc) & 0xFFFFFFFF
+            naive.append(ph / 2 ** 31 - 1.0)
+        self.assertLess(alias_db(blep), alias_db(np.array(naive)) - 10)
+
+    def test_sub_is_one_octave_down(self):
+        x = self._osc(48, n=32768, sub_gain=65535)
+        f = estimate_freq(x)
+        expected = 440.0 * 2 ** ((48 - 69) / 12) / 2
+        self.assertLess(abs(1200 * np.log2(f / expected)), 2.0)
+
+    def test_noise_is_aperiodic(self):
+        """Noise: no autocorrelation peak (unlike a pitched source)."""
+        x = self._osc(60, n=8192, noise_gain=65535)
+        x = x - x.mean()
+        ac = np.correlate(x, x, mode="full")[len(x) - 1:]
+        self.assertLess(np.max(np.abs(ac[10:2000])) / ac[0], 0.1)
 
     def test_dco_square_has_weak_even_harmonics(self):
-        """Rendered through the voice: the pw=0 pulse (near-square) has a much
-        weaker 2nd harmonic than the saw."""
-        def h2_over_h1(table):
-            p = Params(**self.FAST_FULL, cutoff=0.95, env_amt=0.0, kbd=0.0, wavetable=table)
+        """Rendered through the voice: the near-square pulse has a much weaker
+        2nd harmonic than the saw."""
+        def h2_over_h1(**dco):
+            p = Params(**self.FAST_FULL, cutoff=0.95, env_amt=0.0, kbd=0.0, **dco)
             out = render([Note(0, 69, 0.0, 1.0)], seconds=0.04, params=p)
             x = out[len(out) // 3:, 0]
             x = (x - x.mean()) * np.hanning(len(x))
@@ -212,8 +283,8 @@ class JunoVoiceTests(unittest.TestCase):
             f = np.fft.rfftfreq(len(x), 1 / FS)
             h = lambda k: mag[np.argmin(np.abs(f - 440.0 * k))]
             return h(2) / h(1)
-        saw = h2_over_h1(juno_table(True, False))
-        square = h2_over_h1(juno_table(False, True, 0.0))
+        saw = h2_over_h1(saw=True, pulse=False)
+        square = h2_over_h1(saw=False, pulse=True, pw=0.0)
         self.assertGreater(saw, 0.3)
         self.assertLess(square, saw / 3)
 

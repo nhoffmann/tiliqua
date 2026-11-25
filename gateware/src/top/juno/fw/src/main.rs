@@ -32,7 +32,7 @@ use hal::tusb322::{TUSB322Driver, TUSB322Mode, AttachedState, AccessoryType};
 use hal::i2c::{I2cBus, I2cDevice};
 use static_cell::StaticCell;
 
-use tiliqua_fw::wavetable;
+use tiliqua_fw::dco;
 
 pub const TICK_PERIOD_MS: u32 = 5;
 
@@ -171,30 +171,15 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_sustain_level((u32::from(opts.adsr.sustain.value) * 65535 / 32768) as u16);
         app.synth.set_release_rate(adsr_ui_to_rate(opts.adsr.release.value));
 
-        // LFO -> phase modulation CSR
-        {
-            use wavetable::{Fix32, CYCLE_LEN};
-            let isr_rate = Fix32::from_num(1000u32 / TICK_PERIOD_MS);
-            // lfo_rate option: 0..50 -> 0..5.0 Hz
-            // Q16.16 from_bits: value * 65536 / 10 = value * 6554
-            let rate_hz = Fix32::from_bits(i32::from(opts.voice.lfo_rate.value) * 6554);
-            let phase_inc = rate_hz * CYCLE_LEN as i32 / isr_rate;
-            // depth option: 0..32768 -> 0..1.0
-            let depth = Fix32::from_bits(i32::from(opts.voice.lfo_depth.value) * 2);
-            let lfo_val = wavetable::wt_lfo(&mut app.lfo_phase, phase_inc, depth,
-                                           Waveform::Sine);
-            app.synth.set_lfo(lfo_val);
+        // Juno DCO mixer (live; cheap register writes every tick)
+        app.synth.set_dco(opts.dco.saw.value == Switch::On, opts.dco.pulse.value == Switch::On);
+        if app.last_pw != Some(opts.dco.pw.value) {
+            // float sqrt: only recomputed when the knob moves
+            app.last_pw = Some(opts.dco.pw.value);
+            app.synth.set_pw_point(dco::pw_knob_to_point(opts.dco.pw.value));
         }
-
-        // Wavetable update on parameter change
-        let dco = wavetable::Dco::new(opts.dco.saw.value, opts.dco.pulse.value, opts.dco.pw.value);
-        let wt_params = (opts.voice.waveform.value, opts.voice.proc.value,
-                         opts.voice.proc_amt.value, dco);
-        if app.last_wt_params != Some(wt_params) {
-            app.last_wt_params = Some(wt_params);
-            wavetable::wt_write(&mut app.synth, opts.voice.waveform.value, &dco,
-                                opts.voice.proc.value, opts.voice.proc_amt.value);
-        }
+        app.synth.set_mix_levels(dco::sub_gain(opts.dco.sub.value),
+                                 dco::level_gain(opts.dco.noise.value));
     });
 }
 
@@ -215,17 +200,13 @@ fn apply_cc_action(opts: &mut Opts, action: &opts::cc_map::CcAction) {
 
 fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     let mut m = MidiCcMapper::new();
-    // Voice page (CC 20-25)
-    m.add(20, global_index(opts, &opts.voice.waveform),  CcMapMode::Absolute);
-    m.add(21, global_index(opts, &opts.voice.proc),      CcMapMode::Absolute);
-    m.add(22, global_index(opts, &opts.voice.proc_amt),  CcMapMode::Absolute);
-    m.add(23, global_index(opts, &opts.vcf.reso),        CcMapMode::Absolute);
-    m.add(24, global_index(opts, &opts.voice.lfo_rate),  CcMapMode::Absolute);
-    m.add(25, global_index(opts, &opts.voice.lfo_depth), CcMapMode::Absolute);
-    // DCO page (CC 17-19)
+    // DCO page (CC 17-21)
     m.add(17, global_index(opts, &opts.dco.saw),         CcMapMode::Absolute);
     m.add(18, global_index(opts, &opts.dco.pulse),       CcMapMode::Absolute);
     m.add(19, global_index(opts, &opts.dco.pw),          CcMapMode::Absolute);
+    m.add(20, global_index(opts, &opts.dco.sub),         CcMapMode::Absolute);
+    m.add(21, global_index(opts, &opts.dco.noise),       CcMapMode::Absolute);
+    m.add(23, global_index(opts, &opts.vcf.reso),        CcMapMode::Absolute);
     // VCF page (CC 23, 26-29)
     m.add(26, global_index(opts, &opts.vcf.cutoff),      CcMapMode::Absolute);
     m.add(27, global_index(opts, &opts.vcf.env_amt),     CcMapMode::Absolute);
@@ -255,13 +236,10 @@ struct App {
     cutoff_smoother: OnePoleSmoother,
     // last mod wheel (CC1) value, 0..127
     mod_wheel: u8,
-    // wavetable state
-    // last written wavetable params (None = not written yet)
-    last_wt_params: Option<(Waveform, ProcMode, u16, wavetable::Dco)>,
+    // last PW knob value written (None = not written yet)
+    last_pw: Option<u16>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
-    // lfo phase accumulator
-    lfo_phase: wavetable::Fix32,
 }
 
 impl App {
@@ -281,9 +259,8 @@ impl App {
             diffusion_smoother,
             cutoff_smoother,
             mod_wheel: 0,
-            last_wt_params: None,
+            last_pw: None,
             cc_mapper,
-            lfo_phase: wavetable::Fix32::ZERO,
         }
     }
 }
@@ -477,14 +454,12 @@ fn main() -> ! {
                         HUE,
                         highlight).ok();
                 }
-                if opts.tracker.page.value == Page::Voice || opts.tracker.page.value == Page::Dco {
+                if opts.tracker.page.value == Page::Dco {
                     const PREVIEW_LEN: usize = 64;
                     let mut preview = [0i16; PREVIEW_LEN];
-                    let dco = wavetable::Dco::new(opts.dco.saw.value,
-                        opts.dco.pulse.value, opts.dco.pw.value);
-                    wavetable::wt_preview(&mut preview,
-                        opts.voice.waveform.value, &dco, opts.voice.proc.value,
-                        opts.voice.proc_amt.value);
+                    dco::preview(&mut preview, opts.dco.saw.value == Switch::On,
+                                 opts.dco.pulse.value == Switch::On, opts.dco.pw.value,
+                                 opts.dco.sub.value);
                     draw::draw_waveform_preview(&mut display,
                         h_active/2-190, 80,
                         125, 40,

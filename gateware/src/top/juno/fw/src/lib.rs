@@ -11,6 +11,6 @@ tiliqua_lib::impl_tick!(Clint);
 
 pub mod options;
 pub mod polysynth;
-pub mod wavetable;
+pub mod dco;
 
 pub use polysynth::Polysynth0;

@@ -15,9 +15,10 @@ Usage (writes WAVs to ``build/juno_sim/``)::
 """
 
 import argparse
+import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from amaranth import Module
@@ -31,7 +32,6 @@ from top.juno.juno_voice import JunoVoice, MultiADSR, MultiSVF, PitchToInc
 
 FS = 48000
 N_VOICES = 6
-WT_SIZE = JunoVoice.WAVETABLE_SIZE
 EnvUQ = MultiADSR.EnvUQ
 
 
@@ -52,31 +52,13 @@ def cutoff_base(cutoff, kbd, note, mod_wheel=0.0):
 MOD_WHEEL_RANGE = 0.5
 
 
-def saw_table(amplitude=0.9):
-    return [int(amplitude * 32767 * (2.0 * i / WT_SIZE - 1.0)) for i in range(WT_SIZE)]
-
-
-def juno_table(saw=True, pulse=False, pw=0.0):
-    """Mirror of the firmware `Waveform::Juno` generator (fw/src/wavetable.rs):
-    curved ramp p * (1 + 0.15 (1 - p)); pulse = comparator on the ramp with
-    threshold 0.5 + 0.46 * pw; saw + pulse mixed 50/50. Keep both in sync."""
-    table = []
-    threshold = 0.5 + 0.46 * pw
-    for i in range(WT_SIZE):
-        p = i / WT_SIZE
-        ramp = p * (1 + 0.15 * (1 - p))
-        s_saw = 2 * ramp - 1
-        s_pulse = 1.0 if ramp >= threshold else -1.0
-        if saw and pulse:
-            v = (s_saw + s_pulse) / 2
-        elif saw:
-            v = s_saw
-        elif pulse:
-            v = s_pulse
-        else:
-            v = 0.0
-        table.append(max(-32768, min(32767, int(v * 32768))))
-    return table
+def pw_knob_to_point(knob):
+    """PW knob 0..1 -> pulse rising-edge phase, UQ(0,16). Same as the firmware.
+    Juno: comparator at threshold 0.5 + 0.46 * knob on the curved ramp
+    p (1 + 0.15 (1 - p)); solved for the linear phase p (duty ~54 % .. ~4.5 %)."""
+    th = 0.5 + 0.46 * knob
+    p = (1.15 - math.sqrt(1.15 ** 2 - 0.6 * th)) / 0.3
+    return min(65535, round(p * 65536))
 
 
 @dataclass
@@ -103,7 +85,12 @@ class Params:
     mod_wheel: float = 0.0
     bend_semitones: float = 0.0    # pitch bend applied to all notes (top.py: +-2 range)
     cutoff_cv_volts: float = 0.0   # CV in1, 1 V/oct
-    wavetable: list = field(default_factory=juno_table)  # firmware default: juno, saw only
+    # Juno DCO mixer (firmware defaults: saw on, rest off)
+    saw:   bool = True
+    pulse: bool = False
+    pw:    float = 0.0     # PW knob 0..1
+    sub:   float = 0.0     # sub level 0..1
+    noise: float = 0.0     # noise level 0..1
 
 
 def render(notes, seconds, params=None, n_voices=N_VOICES):
@@ -123,12 +110,11 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
     events.sort(key=lambda e: (e[0], e[2]))
 
     async def testbench(ctx):
-        for addr, sample in enumerate(params.wavetable):
-            ctx.set(dut.wt_write_addr, addr)
-            ctx.set(dut.wt_write_data, sample)
-            ctx.set(dut.wt_write_en, 1)
-            await ctx.tick()
-        ctx.set(dut.wt_write_en, 0)
+        ctx.set(dut.saw_en, int(params.saw))
+        ctx.set(dut.pulse_en, int(params.pulse))
+        ctx.set(dut.pw_point, pw_knob_to_point(params.pw))
+        ctx.set(dut.sub_gain, round(0.67 * params.sub * 65535))
+        ctx.set(dut.noise_gain, round(params.noise * 65535))
 
         ctx.set(dut.attack_rate.as_value(), params.attack)
         ctx.set(dut.decay_rate.as_value(), params.decay)
@@ -195,11 +181,19 @@ SCENES = {
     # Juno DCO mixer: same phrase with saw, square, narrow pulse, saw+pulse
     "dco_saw":    (lambda s: [Note(0, 48, 0.0, s * 0.8)], Params(cutoff=0.6, env_amt=0.2)),
     "dco_square": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
-                   Params(cutoff=0.6, env_amt=0.2, wavetable=juno_table(False, True, 0.0))),
+                   Params(cutoff=0.6, env_amt=0.2, saw=False, pulse=True, pw=0.0)),
     "dco_narrow": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
-                   Params(cutoff=0.6, env_amt=0.2, wavetable=juno_table(False, True, 0.8))),
+                   Params(cutoff=0.6, env_amt=0.2, saw=False, pulse=True, pw=0.8)),
     "dco_saw_pulse": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
-                      Params(cutoff=0.6, env_amt=0.2, wavetable=juno_table(True, True, 0.5))),
+                      Params(cutoff=0.6, env_amt=0.2, saw=True, pulse=True, pw=0.5)),
+    # sub oscillator and noise
+    "dco_saw_sub": (lambda s: [Note(0, 36, 0.0, s * 0.8)],
+                    Params(cutoff=0.5, env_amt=0.3, saw=True, sub=1.0)),
+    "dco_noise":   (lambda s: [Note(0, 60, 0.0, s * 0.8)],
+                    Params(cutoff=0.8, env_amt=0.0, saw=False, noise=1.0)),
+    # high note: PolyBLEP keeps aliasing down
+    "dco_high_saw": (lambda s: [Note(0, 96, 0.0, s * 0.8)],
+                     Params(cutoff=1.0, env_amt=0.0, kbd=0.0, saw=True)),
     # same chord, dark vs bright cutoff knob (no env), back to back
     "cutoff_dark": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),

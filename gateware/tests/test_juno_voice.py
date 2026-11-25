@@ -18,7 +18,8 @@ from amaranth.sim import Simulator
 
 from amaranth_future import fixed
 
-from top.juno.juno_voice import MultiJunoOsc, MultiSVF, PitchToInc
+from top.juno.juno_voice import MultiJunoOsc, MultiSVF, PipelinedMAC, PitchToInc
+from top.juno.juno_lfo import JunoLfo, JunoLfoModel
 from top.juno.osc_model import OscModel
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point, render
@@ -139,6 +140,49 @@ class JunoVoiceTests(unittest.TestCase):
                          f"got {[got[i] for i in mismatches[:3]]}, "
                          f"expected {[expected[i] for i in mismatches[:3]]}")
         self.assertGreater(np.std(got), 1000)   # not silent
+
+    def test_juno_lfo_matches_model(self):
+        """JunoLfo gateware is bit-exact with JunoLfoModel: fast rate (several
+        cycles), delay ramp restarted by a new note after all keys released,
+        PWM manual and LFO mode."""
+        frames = []
+        for f in range(240):
+            frames.append(dict(
+                rate_inc=(1 << 32) // 37 + 12345,
+                delay_step=(1 << 30) // 60,          # 60-frame fade-in
+                any_gate=int(not (100 <= f < 110)),  # keys released, then a new note
+                dco_depth=2560, vcf_depth=9830,
+                pw_knob=24576, pwm_lfo=int(f >= 120)))
+        m = Module()
+        m.submodules.dut = dut = JunoLfo(PipelinedMAC())
+        outs = ["lfo", "vib", "cutoff_mod", "pw_point"]
+        got = []
+
+        async def testbench(ctx):
+            for fr in frames:
+                for k, v in fr.items():
+                    ctx.set(getattr(dut, k), v)
+                ctx.set(dut.tick, 1)
+                await ctx.tick()
+                ctx.set(dut.tick, 0)
+                for _ in range(40):
+                    await ctx.tick()
+                got.append({o: ctx.get(getattr(dut, o)) for o in outs})
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+        model = JunoLfoModel()
+        for i, fr in enumerate(frames):
+            exp = model.frame(**fr)
+            self.assertEqual(got[i], {o: exp[o] for o in outs}, f"frame {i}")
+        lfo = np.array([g["lfo"] for g in got])
+        self.assertGreater(lfo.max(), 30000)          # reaches full amplitude
+        self.assertLess(lfo.min(), -30000)
+        self.assertEqual(lfo[110], 0)                 # delay restarted by the new note (frame 110)
+        self.assertNotEqual(lfo[109], 0)
 
     def test_pitch_bend(self):
         """Pitch bend is exact in the log domain: +2 semitones on A4 -> B4."""
@@ -287,6 +331,37 @@ class JunoVoiceTests(unittest.TestCase):
         square = h2_over_h1(saw=False, pulse=True, pw=0.0)
         self.assertGreater(saw, 0.3)
         self.assertLess(square, saw / 3)
+
+    def test_vca_gate_mode(self):
+        """Gate mode: with sustain 0 the envelope dies away, but the VCA holds
+        the note at full level while the key is held, and cuts it quickly on
+        release (the filter still follows the envelope)."""
+        p = Params(attack=8192, decay=2048, sustain=0, release=2048,
+                   cutoff=0.8, env_amt=0.0, kbd=0.0, vca_gate=True)
+        out = render([Note(0, 60, 0.0, 0.012)], seconds=0.018, params=p)
+        early = rms(out[int(0.002 * FS):int(0.004 * FS), 0])
+        late_held = rms(out[int(0.009 * FS):int(0.012 * FS), 0])
+        after = rms(out[int(0.0145 * FS):, 0])
+        self.assertGreater(late_held, 0.8 * early)    # env mode would be ~0 here
+        self.assertLess(after, 0.01 * early)
+
+    def test_lfo_vibrato(self):
+        """LFO -> pitch: 1 semitone depth at 40 Hz swings the period by about
+        +-1 semitone; without vibrato the swing is ~0."""
+        def swing_semitones(depth):
+            p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
+                       cutoff=0.9, env_amt=0.0, kbd=0.0, dco_lfo_semi=depth,
+                       lfo_rate_hz=40.0)
+            out = render([Note(0, 81, 0.0, 1.0)], seconds=0.06, params=p)
+            x = out[len(out) // 6:, 0]
+            x = x - x.mean()
+            # rising zero crossings with linear interpolation
+            idx = np.where((x[:-1] < 0) & (x[1:] >= 0))[0]
+            zc = idx + x[idx] / (x[idx] - x[idx + 1])
+            periods = np.diff(zc)
+            return 12 * np.log2(periods.max() / periods.min()) / 2
+        self.assertLess(swing_semitones(0.0), 0.15)
+        self.assertAlmostEqual(swing_semitones(1.0), 1.0, delta=0.3)
 
     def test_vca_zero_sustain_decays_while_held(self):
         """Sustain 0: the note dies away although the gate is still held (pluck)."""

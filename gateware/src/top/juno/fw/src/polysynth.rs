@@ -88,13 +88,29 @@ impl Polysynth0 {
     }
 
     /// Juno DCO mixer switches.
-    pub fn set_dco(&mut self, saw: bool, pulse: bool)  {
-        self.registers.dco().write(|w| w.saw().bit(saw).pulse().bit(pulse) );
+    pub fn set_dco(&mut self, saw: bool, pulse: bool, pwm_lfo: bool, vca_gate: bool)  {
+        self.registers.dco().write(|w| w.saw().bit(saw).pulse().bit(pulse)
+                                         .pwm_lfo().bit(pwm_lfo).vca_gate().bit(vca_gate) );
     }
 
-    /// Pulse rising-edge phase, UQ(0,16) (see dco::pw_knob_to_point).
-    pub fn set_pw_point(&mut self, value: u16)  {
-        self.registers.pw_point().write(|w| unsafe { w.value().bits(value) } );
+    /// PW knob 0..32768 (gateware maps it through the curve LUT, incl. LFO PWM).
+    pub fn set_pw_knob(&mut self, value: u16)  {
+        self.registers.pw_knob().write(|w| unsafe { w.value().bits(value) } );
+    }
+
+    /// LFO phase increment per audio frame, UQ(0,32).
+    pub fn set_lfo_rate(&mut self, inc: u32)  {
+        self.registers.lfo_rate().write(|w| unsafe { w.value().bits(inc) } );
+    }
+
+    /// LFO delay: amplitude step per frame, 2**30 = immediate.
+    pub fn set_lfo_delay(&mut self, step: u32)  {
+        self.registers.lfo_delay().write(|w| unsafe { w.value().bits(step) } );
+    }
+
+    /// LFO depths: pitch (1/1024 semitones), cutoff (normalized octaves, 15 bit).
+    pub fn set_lfo_depths(&mut self, dco: u16, vcf: u16)  {
+        self.registers.lfo_depths().write(|w| unsafe { w.dco().bits(dco).vcf().bits(vcf) } );
     }
 
     /// Sub-oscillator and noise gains, UQ(0,16).

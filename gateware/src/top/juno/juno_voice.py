@@ -732,6 +732,12 @@ class MultiSVF(wiring.Component):
             "voice_cutoff_base": In(data.ArrayLayout(ASQ, n)),
             "env_amt":    In(ASQ),
             "cutoff_cv":  In(ASQ),
+            # LFO -> cutoff (normalized octaves, added like cutoff_cv but unscaled)
+            "cutoff_mod": In(ASQ),
+            # VCA Gate mode: VCA follows gate x velocity (~1.5 ms ramp) instead of env
+            "vca_gate_mode":  In(1),
+            "voice_gates":    In(data.ArrayLayout(unsigned(1), n)),
+            "voice_velocity": In(data.ArrayLayout(env_uq, n)),
             "o":    Out(stream.Signature(Block(sq))),
         })
 
@@ -749,6 +755,7 @@ class MultiSVF(wiring.Component):
             "ahp":  svf_sh,
             "dc_x": svf_sh,
             "dc_y": svf_sh,
+            "gate_env": unsigned(16),   # Gate-mode VCA level, 15-bit (32768 = 1.0)
         })
         m.submodules.state_mem = state_mem = Memory(
             shape=state_layout, depth=N, init=[])
@@ -780,6 +787,10 @@ class MultiSVF(wiring.Component):
         cut_base = Signal(mac.SQNative)
         cut_amt  = Signal(mac.SQNative)
         cut_cv   = Signal(mac.SQNative)
+        cut_mod  = Signal(mac.SQNative)
+        m.d.comb += cut_mod.eq(self.cutoff_mod)
+        gate_env = Signal(16)
+        GATE_STEP = 1 << 10   # 1/32 per sample: ~0.7 ms full-scale ramp at 48 kHz
         cut_c    = Signal(mac.SQNative)
         m.d.comb += [
             cut_amt.eq(self.env_amt),
@@ -820,6 +831,7 @@ class MultiSVF(wiring.Component):
                     svf_ahp.eq(st_rport.data.ahp),
                     dc_x.eq(st_rport.data.dc_x),
                     dc_y.eq(st_rport.data.dc_y),
+                    gate_env.eq(st_rport.data.gate_env),
                 ]
                 with m.Switch(voice_ix):
                     for n in range(N):
@@ -830,7 +842,7 @@ class MultiSVF(wiring.Component):
             with m.State('CUTOFF-MUL'):
                 # c = base + env_amt * env + cv
                 with mp.Multiply(m, a=vca_env, b=cut_amt):
-                    m.d.sync += cut_c.eq(cut_base + mp.result.z + cut_cv)
+                    m.d.sync += cut_c.eq(cut_base + mp.result.z + cut_cv + cut_mod)
                     m.next = 'CUTOFF-ADDR'
 
             with m.State('CUTOFF-ADDR'):
@@ -880,6 +892,33 @@ class MultiSVF(wiring.Component):
                     dc_y.eq(svf_out - dc_x + dc_y - (dc_y >> DC_SHIFT)),
                     dc_x.eq(svf_out),
                 ]
+                m.next = 'GATE-ENV'
+
+            with m.State('GATE-ENV'):
+                # Gate mode: per-voice level ramps toward velocity (gate on) or 0
+                # (gate off) by 1/32 per sample, avoiding clicks. Always tracked,
+                # so switching modes doesn't jump.
+                cur_gate = Signal()
+                cur_vel = Signal(16)
+                with m.Switch(voice_ix):
+                    for n in range(N):
+                        with m.Case(n):
+                            m.d.comb += [
+                                cur_gate.eq(self.voice_gates[n]),
+                                cur_vel.eq(self.voice_velocity[n].as_value() >> 1),
+                            ]
+                target = Signal(16)
+                m.d.comb += target.eq(Mux(cur_gate, cur_vel, 0))
+                new_gate_env = Signal(16)
+                with m.If(gate_env + GATE_STEP <= target):
+                    m.d.comb += new_gate_env.eq(gate_env + GATE_STEP)
+                with m.Elif(gate_env >= target + GATE_STEP):
+                    m.d.comb += new_gate_env.eq(gate_env - GATE_STEP)
+                with m.Else():
+                    m.d.comb += new_gate_env.eq(target)
+                m.d.sync += gate_env.eq(new_gate_env)
+                with m.If(self.vca_gate_mode):
+                    m.d.sync += vca_env.as_value().eq(new_gate_env)
                 m.next = 'VCA'
 
             with m.State('VCA'):
@@ -895,6 +934,7 @@ class MultiSVF(wiring.Component):
                     st_wport.data.ahp.eq(svf_ahp),
                     st_wport.data.dc_x.eq(dc_x),
                     st_wport.data.dc_y.eq(dc_y),
+                    st_wport.data.gate_env.eq(gate_env),
                     st_wport.en.eq(1),
                 ]
                 m.next = 'EMIT'
@@ -1002,6 +1042,9 @@ class JunoVoice(wiring.Component):
             "voice_cutoff_base": In(data.ArrayLayout(ASQ, self.n_voices)),
             "env_amt":        In(ASQ),
             "cutoff_cv":      In(ASQ),
+            # LFO -> cutoff (normalized octaves) and VCA Gate mode
+            "cutoff_mod":     In(ASQ),
+            "vca_gate_mode":  In(1),
             "attack_rate":    In(MultiADSR.EnvUQ),
             "decay_rate":     In(MultiADSR.EnvUQ),
             "sustain_level":  In(MultiADSR.EnvUQ),
@@ -1042,6 +1085,8 @@ class JunoVoice(wiring.Component):
                 adsr.voice_velocity[n].eq(self.voice_velocity[n]),
                 self.voice_active[n].eq(adsr.voice_active[n]),
                 svf.voice_cutoff_base[n].eq(self.voice_cutoff_base[n]),
+                svf.voice_gates[n].eq(self.voice_gates[n]),
+                svf.voice_velocity[n].eq(self.voice_velocity[n]),
             ]
         m.d.comb += [
             osc.saw_en.eq(self.saw_en),
@@ -1056,6 +1101,8 @@ class JunoVoice(wiring.Component):
             svf.reso.eq(self.reso),
             svf.env_amt.eq(self.env_amt),
             svf.cutoff_cv.eq(self.cutoff_cv),
+            svf.cutoff_mod.eq(self.cutoff_mod),
+            svf.vca_gate_mode.eq(self.vca_gate_mode),
         ]
 
         # Stream pipeline

@@ -87,6 +87,11 @@ can also be used to control most of these through CCs as follows:
         HELP    scroll         -  scroll help text up/down
 
 
+        LFO     rate          24  LFO rate (~0.1 .. 20 Hz)
+        LFO     delay         25  LFO fade-in after a new note (0 .. 1.5 s)
+
+        DCO     lfo           22  LFO -> pitch (vibrato depth)
+        DCO     pwm-mode      16  pulse width source: manual / LFO
         DCO     saw           17  saw on/off (Juno curved ramp)
         DCO     pulse         18  pulse on/off
         DCO     pw            19  pulse width (0 = square .. narrow)
@@ -98,11 +103,13 @@ can also be used to control most of these through CCs as follows:
         VCF     env-amt       27  envelope -> cutoff amount
         VCF     env-pol       28  envelope polarity (+/-)
         VCF     kbd-track     29  keyboard tracking (0 = off, 1 = 100 %)
+        VCF     lfo           34  LFO -> cutoff
 
         ADSR    attack        30  envelope attack (VCF + VCA)
         ADSR    decay         31  envelope decay
         ADSR    sustain       32  envelope sustain
         ADSR    release       33  envelope release
+        ADSR    vca-mode      35  VCA follows envelope or gate
 
         EFFECT  drive         40  distortion amount
         EFFECT  diffuse       41  diffusion wet/dry mix
@@ -141,7 +148,8 @@ from tiliqua.dsp import ASQ
 from tiliqua.tiliqua_soc import TiliquaSoc
 
 # top.py is run as a script (pdm run juno), so import the sibling module directly.
-from juno_voice import JunoVoice, MultiADSR, PitchToInc
+from juno_voice import MultiADSR, PitchToInc
+from juno_core import JunoCore
 from juno_tracker import JunoVoiceState, JunoVoiceTracker
 
 class Diffuser(wiring.Component):
@@ -199,9 +207,17 @@ class PolySynth(wiring.Component):
     # Juno DCO mixer (global)
     saw_en: In(1)
     pulse_en: In(1)
-    pw_point: In(unsigned(16))
+    pw_knob: In(unsigned(16))
+    pwm_lfo: In(1)
     sub_gain: In(unsigned(16))
     noise_gain: In(unsigned(16))
+
+    # VCA mode and LFO
+    vca_gate_mode: In(1)
+    lfo_rate_inc: In(unsigned(32))
+    lfo_delay_step: In(unsigned(32))
+    lfo_dco_depth: In(unsigned(16))
+    lfo_vcf_depth: In(unsigned(16))
 
 
     # Jack detection (directly from pmod hardware)
@@ -231,7 +247,8 @@ class PolySynth(wiring.Component):
         # Connect MIDI stream -> voice tracker
         wiring.connect(m, wiring.flipped(self.i_midi), voice_tracker.i)
 
-        m.submodules.voice_block = voice_block = JunoVoice(n_voices=n_voices)
+        # Juno voices + global LFO (same wiring as sim_render.py)
+        m.submodules.voice_block = voice_block = JunoCore(n_voices=n_voices)
 
         # latch CV ins
         cv = Signal.like(self.i.payload)
@@ -254,7 +271,7 @@ class PolySynth(wiring.Component):
             # Note-on velocity scales the envelope (VCF + VCA).
             vel_out = Signal(MultiADSR.EnvUQ, name=f"vel_out_{n}")
             m.d.comb += vel_out.eq(fixed.UQ(0, 8)(voice_tracker.o[n].velocity_on))
-            # Log-domain pitch: note + pitch bend (later: LFO vibrato, CV, detune)
+            # Log-domain pitch: note + pitch bend (+ LFO vibrato in JunoCore)
             pitch = Signal(PitchToInc.PitchSQ, name=f"pitch_{n}")
             m.d.comb += pitch.as_value().eq(
                 (voice_tracker.o[n].note << PitchToInc.FINE_BITS)
@@ -263,7 +280,7 @@ class PolySynth(wiring.Component):
                 self.voice_states[n].eq(voice_tracker.o[n]),
                 self.voice_cutoffs[n].eq(voice_block.voice_cutoffs[n]),
                 voice_block.voice_gates[n].eq(voice_tracker.o[n].gate),
-                voice_block.voice_pitch[n].eq(pitch),
+                voice_block.voice_pitch_base[n].eq(pitch),
                 voice_block.voice_velocity[n].eq(vel_out),
                 voice_block.voice_cutoff_base[n].eq(self.voice_cutoff_base[n]),
                 voice_tracker.voice_active[n].eq(voice_block.voice_active[n]),
@@ -281,9 +298,15 @@ class PolySynth(wiring.Component):
             voice_block.release_rate.eq(self.release_rate),
             voice_block.saw_en.eq(self.saw_en),
             voice_block.pulse_en.eq(self.pulse_en),
-            voice_block.pw_point.eq(self.pw_point),
+            voice_block.pw_knob.eq(self.pw_knob),
+            voice_block.pwm_lfo.eq(self.pwm_lfo),
             voice_block.sub_gain.eq(self.sub_gain),
             voice_block.noise_gain.eq(self.noise_gain),
+            voice_block.vca_gate_mode.eq(self.vca_gate_mode),
+            voice_block.lfo_rate_inc.eq(self.lfo_rate_inc),
+            voice_block.lfo_delay_step.eq(self.lfo_delay_step),
+            voice_block.lfo_dco_depth.eq(self.lfo_dco_depth),
+            voice_block.lfo_vcf_depth.eq(self.lfo_vcf_depth),
         ]
 
         # Output diffuser
@@ -357,11 +380,23 @@ class SynthPeripheral(wiring.Component):
         value: csr.Field(csr.action.W, unsigned(16))
 
     class Dco(csr.Register, access="w"):
-        saw:   csr.Field(csr.action.W, unsigned(1))
-        pulse: csr.Field(csr.action.W, unsigned(1))
+        saw:      csr.Field(csr.action.W, unsigned(1))
+        pulse:    csr.Field(csr.action.W, unsigned(1))
+        pwm_lfo:  csr.Field(csr.action.W, unsigned(1))
+        vca_gate: csr.Field(csr.action.W, unsigned(1))
 
-    class PwPoint(csr.Register, access="w"):
+    class PwKnob(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
+
+    class LfoRate(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(32))
+
+    class LfoDelay(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(32))
+
+    class LfoDepths(csr.Register, access="w"):
+        dco: csr.Field(csr.action.W, unsigned(16))
+        vcf: csr.Field(csr.action.W, unsigned(16))
 
     class MixLevels(csr.Register, access="w"):
         sub:   csr.Field(csr.action.W, unsigned(16))
@@ -407,7 +442,8 @@ class SynthPeripheral(wiring.Component):
 
     def __init__(self, synth=None):
         self.synth = synth
-        regs = csr.Builder(addr_width=7, data_width=8)
+        # 8-bit address space (256 B): the 128 B window filled up with the LFO registers
+        regs = csr.Builder(addr_width=8, data_width=8)
         voices_csr_end = 0x8+PolySynth.N_VOICES*4
         self._drive         = regs.add("drive",         self.Drive(),         offset=0x0)
         self._reso          = regs.add("reso",          self.Reso(),          offset=0x4)
@@ -426,12 +462,15 @@ class SynthPeripheral(wiring.Component):
         self._release_rate  = regs.add("release_rate",  self.ReleaseRate(),   offset=voices_csr_end + 0x28)
         # 0x2C..0x34 were wavetable addr/data + LFO (removed with the wavetable oscillator)
         self._dco           = regs.add("dco",           self.Dco(),           offset=voices_csr_end + 0x2C)
-        self._pw_point      = regs.add("pw_point",      self.PwPoint(),       offset=voices_csr_end + 0x30)
+        self._pw_knob       = regs.add("pw_knob",       self.PwKnob(),        offset=voices_csr_end + 0x30)
         self._mix_levels    = regs.add("mix_levels",    self.MixLevels(),     offset=voices_csr_end + 0x34)
         self._midi_ch_filt  = regs.add("midi_ch_filter",self.MidiChannelFilter(), offset=voices_csr_end + 0x38)
         self._env_amt       = regs.add("env_amt",       self.EnvAmt(),        offset=voices_csr_end + 0x3C)
         self._cutoff_base   = [regs.add(f"cutoff_base{i}", self.CutoffBase(),
                                offset=voices_csr_end + 0x40 + i*4) for i in range(PolySynth.N_VOICES)]
+        self._lfo_rate      = regs.add("lfo_rate",      self.LfoRate(),       offset=voices_csr_end + 0x58)
+        self._lfo_delay     = regs.add("lfo_delay",     self.LfoDelay(),      offset=voices_csr_end + 0x5C)
+        self._lfo_depths    = regs.add("lfo_depths",    self.LfoDepths(),     offset=voices_csr_end + 0x60)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -473,9 +512,21 @@ class SynthPeripheral(wiring.Component):
             m.d.sync += [
                 self.synth.saw_en.eq(self._dco.f.saw.w_data),
                 self.synth.pulse_en.eq(self._dco.f.pulse.w_data),
+                self.synth.pwm_lfo.eq(self._dco.f.pwm_lfo.w_data),
+                self.synth.vca_gate_mode.eq(self._dco.f.vca_gate.w_data),
             ]
-        with m.If(self._pw_point.f.value.w_stb):
-            m.d.sync += self.synth.pw_point.eq(self._pw_point.f.value.w_data)
+        with m.If(self._pw_knob.f.value.w_stb):
+            m.d.sync += self.synth.pw_knob.eq(self._pw_knob.f.value.w_data)
+        # LFO
+        with m.If(self._lfo_rate.f.value.w_stb):
+            m.d.sync += self.synth.lfo_rate_inc.eq(self._lfo_rate.f.value.w_data)
+        with m.If(self._lfo_delay.f.value.w_stb):
+            m.d.sync += self.synth.lfo_delay_step.eq(self._lfo_delay.f.value.w_data)
+        with m.If(self._lfo_depths.element.w_stb):
+            m.d.sync += [
+                self.synth.lfo_dco_depth.eq(self._lfo_depths.f.dco.w_data),
+                self.synth.lfo_vcf_depth.eq(self._lfo_depths.f.vcf.w_data),
+            ]
         with m.If(self._mix_levels.element.w_stb):
             m.d.sync += [
                 self.synth.sub_gain.eq(self._mix_levels.f.sub.w_data),

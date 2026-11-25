@@ -33,6 +33,7 @@ use hal::i2c::{I2cBus, I2cDevice};
 use static_cell::StaticCell;
 
 use tiliqua_fw::dco;
+use tiliqua_fw::lfo;
 
 pub const TICK_PERIOD_MS: u32 = 5;
 
@@ -171,15 +172,25 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_sustain_level((u32::from(opts.adsr.sustain.value) * 65535 / 32768) as u16);
         app.synth.set_release_rate(adsr_ui_to_rate(opts.adsr.release.value));
 
-        // Juno DCO mixer (live; cheap register writes every tick)
-        app.synth.set_dco(opts.dco.saw.value == Switch::On, opts.dco.pulse.value == Switch::On);
-        if app.last_pw != Some(opts.dco.pw.value) {
-            // float sqrt: only recomputed when the knob moves
-            app.last_pw = Some(opts.dco.pw.value);
-            app.synth.set_pw_point(dco::pw_knob_to_point(opts.dco.pw.value));
-        }
+        // Juno DCO mixer + modes (live; cheap register writes every tick)
+        app.synth.set_dco(opts.dco.saw.value == Switch::On,
+                          opts.dco.pulse.value == Switch::On,
+                          opts.dco.pwm_mode.value == PwmMode::Lfo,
+                          opts.adsr.vca_mode.value == VcaMode::Gate);
+        app.synth.set_pw_knob(opts.dco.pw.value);
         app.synth.set_mix_levels(dco::sub_gain(opts.dco.sub.value),
                                  dco::level_gain(opts.dco.noise.value));
+
+        // LFO (float conversions only when a knob moves)
+        let lfo_knobs = (opts.lfo.rate.value, opts.lfo.delay.value,
+                         opts.dco.lfo.value, opts.vcf.lfo.value);
+        if app.last_lfo_knobs != Some(lfo_knobs) {
+            app.last_lfo_knobs = Some(lfo_knobs);
+            app.synth.set_lfo_rate(lfo::rate_inc(opts.lfo.rate.value));
+            app.synth.set_lfo_delay(lfo::delay_step(opts.lfo.delay.value));
+            app.synth.set_lfo_depths(lfo::dco_depth(opts.dco.lfo.value),
+                                     lfo::vcf_depth(opts.vcf.lfo.value));
+        }
     });
 }
 
@@ -200,7 +211,12 @@ fn apply_cc_action(opts: &mut Opts, action: &opts::cc_map::CcAction) {
 
 fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     let mut m = MidiCcMapper::new();
-    // DCO page (CC 17-21)
+    // LFO page (CC 24-25)
+    m.add(24, global_index(opts, &opts.lfo.rate),        CcMapMode::Absolute);
+    m.add(25, global_index(opts, &opts.lfo.delay),       CcMapMode::Absolute);
+    // DCO page (CC 16-22)
+    m.add(16, global_index(opts, &opts.dco.pwm_mode),    CcMapMode::Absolute);
+    m.add(22, global_index(opts, &opts.dco.lfo),         CcMapMode::Absolute);
     m.add(17, global_index(opts, &opts.dco.saw),         CcMapMode::Absolute);
     m.add(18, global_index(opts, &opts.dco.pulse),       CcMapMode::Absolute);
     m.add(19, global_index(opts, &opts.dco.pw),          CcMapMode::Absolute);
@@ -212,11 +228,13 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(27, global_index(opts, &opts.vcf.env_amt),     CcMapMode::Absolute);
     m.add(28, global_index(opts, &opts.vcf.env_pol),     CcMapMode::Absolute);
     m.add(29, global_index(opts, &opts.vcf.kbd_track),   CcMapMode::Absolute);
+    m.add(34, global_index(opts, &opts.vcf.lfo),         CcMapMode::Absolute);
     // ADSR page (CC 30-33)
     m.add(30, global_index(opts, &opts.adsr.attack),  CcMapMode::Absolute);
     m.add(31, global_index(opts, &opts.adsr.decay),   CcMapMode::Absolute);
     m.add(32, global_index(opts, &opts.adsr.sustain), CcMapMode::Absolute);
     m.add(33, global_index(opts, &opts.adsr.release), CcMapMode::Absolute);
+    m.add(35, global_index(opts, &opts.adsr.vca_mode), CcMapMode::Absolute);
     // Effect page (CC 40-41)
     m.add(40, global_index(opts, &opts.effect.drive),    CcMapMode::Absolute);
     m.add(41, global_index(opts, &opts.effect.diffuse),  CcMapMode::Absolute);
@@ -236,8 +254,8 @@ struct App {
     cutoff_smoother: OnePoleSmoother,
     // last mod wheel (CC1) value, 0..127
     mod_wheel: u8,
-    // last PW knob value written (None = not written yet)
-    last_pw: Option<u16>,
+    // last LFO knobs written (rate, delay, dco depth, vcf depth)
+    last_lfo_knobs: Option<(u16, u16, u16, u16)>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
 }
@@ -259,7 +277,7 @@ impl App {
             diffusion_smoother,
             cutoff_smoother,
             mod_wheel: 0,
-            last_pw: None,
+            last_lfo_knobs: None,
             cc_mapper,
         }
     }

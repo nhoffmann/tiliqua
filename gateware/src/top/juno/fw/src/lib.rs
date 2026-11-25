@@ -12,5 +12,6 @@ tiliqua_lib::impl_tick!(Clint);
 pub mod options;
 pub mod polysynth;
 pub mod dco;
+pub mod lfo;
 
 pub use polysynth::Polysynth0;

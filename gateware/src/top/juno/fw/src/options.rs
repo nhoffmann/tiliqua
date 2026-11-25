@@ -7,6 +7,7 @@ use serde_derive::{Serialize, Deserialize};
 pub enum Page {
     #[default]
     Help,
+    Lfo,
     Dco,
     Vcf,
     Adsr,
@@ -20,6 +21,22 @@ pub enum Switch {
     Off,
     #[default]
     On,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum PwmMode {
+    #[default]
+    Man,
+    Lfo,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum VcaMode {
+    #[default]
+    Env,
+    Gate,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -96,10 +113,24 @@ pub struct HelpOpts {
     pub scroll: IntOption<ScrollParams>,
 }
 
+// Juno LFO (JunoLfo): one global triangle LFO with delay (fade-in after a new
+// note). Rate ~0.1 .. 20 Hz (exponential), delay 0 .. 1.5 s.
+#[derive(OptionPage, Clone)]
+pub struct LfoOpts {
+    #[option(21299)]
+    pub rate: IntOption<LevelParams>,
+    #[option(0)]
+    pub delay: IntOption<LevelParams>,
+}
+
 // Juno DCO mixer (MultiJunoOsc): saw / pulse on-off, pulse width,
 // sub-oscillator and noise levels. All live (no table rewrite).
 #[derive(OptionPage, Clone)]
 pub struct DcoOpts {
+    #[option(0)]
+    pub lfo: IntOption<LevelParams>,
+    #[option]
+    pub pwm_mode: EnumOption<PwmMode>,
     #[option(Switch::On)]
     pub saw: EnumOption<Switch>,
     #[option(Switch::Off)]
@@ -125,6 +156,8 @@ pub struct VcfOpts {
     pub env_pol: EnumOption<EnvPolarity>,
     #[option(16384)]
     pub kbd_track: IntOption<KbdTrackParams>,
+    #[option(0)]
+    pub lfo: IntOption<LevelParams>,
 }
 
 #[derive(OptionPage, Clone)]
@@ -145,6 +178,8 @@ pub struct AdsrOpts {
     pub sustain: IntOption<AdsrLevelParams>,
     #[option(4096)]
     pub release: IntOption<AdsrTimeParams>,
+    #[option]
+    pub vca_mode: EnumOption<VcaMode>,
 }
 
 #[derive(OptionPage, Clone)]
@@ -168,6 +203,8 @@ pub struct Opts {
     pub tracker: ScreenTracker<Page>,
     #[page(Page::Help)]
     pub help: HelpOpts,
+    #[page(Page::Lfo)]
+    pub lfo: LfoOpts,
     #[page(Page::Dco)]
     pub dco: DcoOpts,
     #[page(Page::Vcf)]

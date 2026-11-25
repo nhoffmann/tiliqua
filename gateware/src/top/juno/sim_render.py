@@ -15,7 +15,6 @@ Usage (writes WAVs to ``build/juno_sim/``)::
 """
 
 import argparse
-import math
 import os
 import time
 from dataclasses import dataclass
@@ -28,7 +27,9 @@ from amaranth_future import fixed
 from tiliqua.dsp import ASQ
 from tiliqua.test import stream
 
-from top.juno.juno_voice import JunoVoice, MultiADSR, MultiSVF, PitchToInc
+from top.juno.juno_core import JunoCore
+from top.juno.juno_lfo import pw_knob_to_point
+from top.juno.juno_voice import MultiADSR, MultiSVF, PitchToInc
 
 FS = 48000
 N_VOICES = 6
@@ -50,15 +51,6 @@ def cutoff_base(cutoff, kbd, note, mod_wheel=0.0):
 
 # Mod wheel fully up opens the cutoff by this much (normalized octaves).
 MOD_WHEEL_RANGE = 0.5
-
-
-def pw_knob_to_point(knob):
-    """PW knob 0..1 -> pulse rising-edge phase, UQ(0,16). Same as the firmware.
-    Juno: comparator at threshold 0.5 + 0.46 * knob on the curved ramp
-    p (1 + 0.15 (1 - p)); solved for the linear phase p (duty ~54 % .. ~4.5 %)."""
-    th = 0.5 + 0.46 * knob
-    p = (1.15 - math.sqrt(1.15 ** 2 - 0.6 * th)) / 0.3
-    return min(65535, round(p * 65536))
 
 
 @dataclass
@@ -91,6 +83,13 @@ class Params:
     pw:    float = 0.0     # PW knob 0..1
     sub:   float = 0.0     # sub level 0..1
     noise: float = 0.0     # noise level 0..1
+    pwm_lfo: bool = False  # PWM source: LFO (True) or manual knob (False)
+    # LFO (firmware defaults: no modulation)
+    lfo_rate_hz:  float = 5.0
+    lfo_delay_s:  float = 0.0
+    dco_lfo_semi: float = 0.0   # vibrato depth, semitones at full LFO
+    vcf_lfo:      float = 0.0   # LFO -> cutoff, normalized octaves (0.1 = 1 octave)
+    vca_gate:     bool = False  # VCA Gate mode instead of envelope
 
 
 def render(notes, seconds, params=None, n_voices=N_VOICES):
@@ -100,7 +99,7 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
     out = np.zeros((n_samples, 2))
 
     m = Module()
-    m.submodules.dut = dut = JunoVoice(n_voices=n_voices)
+    m.submodules.dut = dut = JunoCore(n_voices=n_voices)
 
     # Gate schedule: per sample index, the state of every voice.
     events = []
@@ -112,7 +111,14 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
     async def testbench(ctx):
         ctx.set(dut.saw_en, int(params.saw))
         ctx.set(dut.pulse_en, int(params.pulse))
-        ctx.set(dut.pw_point, pw_knob_to_point(params.pw))
+        ctx.set(dut.pw_knob, round(params.pw * 32768))
+        ctx.set(dut.pwm_lfo, int(params.pwm_lfo))
+        ctx.set(dut.vca_gate_mode, int(params.vca_gate))
+        ctx.set(dut.lfo_rate_inc, round(params.lfo_rate_hz / FS * 2 ** 32))
+        ctx.set(dut.lfo_delay_step, (1 << 30) if params.lfo_delay_s <= 0
+                else max(1, round((1 << 30) / (params.lfo_delay_s * FS))))
+        ctx.set(dut.lfo_dco_depth, round(params.dco_lfo_semi * 1024))
+        ctx.set(dut.lfo_vcf_depth, round(params.vcf_lfo * 32768))
         ctx.set(dut.sub_gain, round(0.67 * params.sub * 65535))
         ctx.set(dut.noise_gain, round(params.noise * 65535))
 
@@ -130,7 +136,7 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
             while ev < len(events) and events[ev][0] <= i:
                 _, note, gate = events[ev]
                 if gate:
-                    ctx.set(dut.voice_pitch[note.voice],
+                    ctx.set(dut.voice_pitch_base[note.voice],
                             fixed.Const(note.note + params.bend_semitones,
                                         shape=PitchToInc.PitchSQ))
                     ctx.set(dut.voice_velocity[note.voice],
@@ -194,6 +200,20 @@ SCENES = {
     # high note: PolyBLEP keeps aliasing down
     "dco_high_saw": (lambda s: [Note(0, 96, 0.0, s * 0.8)],
                      Params(cutoff=1.0, env_amt=0.0, kbd=0.0, saw=True)),
+    # LFO: vibrato with delay, PWM, filter wobble, VCA gate mode
+    "lfo_vibrato": (lambda s: [Note(0, 60, 0.0, s * 0.9)],
+                    Params(cutoff=0.6, env_amt=0.1, dco_lfo_semi=0.5, lfo_rate_hz=6.0,
+                           lfo_delay_s=0.3)),
+    "lfo_pwm":     (lambda s: [Note(0, 48, 0.0, s * 0.9), Note(1, 55, 0.0, s * 0.9)],
+                    Params(cutoff=0.65, env_amt=0.1, saw=False, pulse=True, pw=0.8,
+                           pwm_lfo=True, lfo_rate_hz=1.5)),
+    "lfo_vcf":     (lambda s: [Note(0, 43, 0.0, s * 0.9)],
+                    Params(cutoff=0.4, env_amt=0.0, reso=12000, vcf_lfo=0.25,
+                           lfo_rate_hz=3.0)),
+    "vca_gate":    (lambda s: [Note(v, 48 + 3 * v, v * s / 6, v * s / 6 + s / 10)
+                               for v in range(N_VOICES)],
+                    Params(vca_gate=True, cutoff=0.3, env_amt=0.5, sustain=0,
+                           decay=adsr_ui_to_rate(3000))),
     # same chord, dark vs bright cutoff knob (no env), back to back
     "cutoff_dark": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),

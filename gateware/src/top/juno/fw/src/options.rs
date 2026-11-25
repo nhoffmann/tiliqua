@@ -8,6 +8,7 @@ pub enum Page {
     #[default]
     Help,
     Voice,
+    Dco,
     Vcf,
     Adsr,
     Effect,
@@ -17,7 +18,9 @@ pub enum Page {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
 #[strum(serialize_all = "kebab-case")]
 pub enum Waveform {
+    // Juno DCO mix (saw / pulse / pulse width from the DCO page)
     #[default]
+    Juno,
     Saw,
     Tri,
     Sine,
@@ -28,6 +31,14 @@ pub enum Waveform {
     Formant,
     OvSine,
     Strng,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum Switch {
+    Off,
+    #[default]
+    On,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -97,6 +108,7 @@ impl MidiChannel {
 int_params!(PageNumParams<u16>    { step: 1, min: 0, max: 0 });
 int_params!(ProcAmtParams<u16>   { step: 1, min: 0, max: 50, format: IntFormat::Scaled { divisor: 10, precision: 1, suffix: "" } });
 int_params!(DriveParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(PwParams<u16>         { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(CutoffParams<u16>     { step: 512, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(EnvAmtParams<u16>     { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(KbdTrackParams<u16>   { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
@@ -128,6 +140,19 @@ pub struct VoiceOpts {
     pub lfo_rate: IntOption<LfoRateParams>,
     #[option(3277)]
     pub lfo_depth: IntOption<LfoDepthParams>,
+}
+
+// Juno-style DCO mixer, used by the `juno` waveform. Static pulse width only
+// (the wavetable is rewritten on change); sub / noise / PWM come with the
+// Phase 2 oscillator.
+#[derive(OptionPage, Clone)]
+pub struct DcoOpts {
+    #[option(Switch::On)]
+    pub saw: EnumOption<Switch>,
+    #[option(Switch::Off)]
+    pub pulse: EnumOption<Switch>,
+    #[option(0)]
+    pub pw: IntOption<PwParams>,
 }
 
 // Juno-style VCF: exponential cutoff (0..1 = 10 octaves, 12 Hz .. 12 kHz).
@@ -188,6 +213,8 @@ pub struct Opts {
     pub help: HelpOpts,
     #[page(Page::Voice)]
     pub voice: VoiceOpts,
+    #[page(Page::Dco)]
+    pub dco: DcoOpts,
     #[page(Page::Vcf)]
     pub vcf: VcfOpts,
     #[page(Page::Adsr)]

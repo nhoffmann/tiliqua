@@ -91,9 +91,13 @@ can also be used to control most of these through CCs as follows:
         ────    ─────────     ──  ───────────
         HELP    scroll         -  scroll help text up/down
 
-        VOICE   waveform      20  wavetable selection
+        VOICE   waveform      20  wavetable selection (`juno` = DCO page mix)
         VOICE   proc          21  wavetable processing mode
         VOICE   proc-amt      22  wavetable processing amount
+
+        DCO     saw           17  saw on/off (Juno curved ramp)
+        DCO     pulse         18  pulse on/off
+        DCO     pw            19  pulse width (0 = square .. narrow)
 
         VCF     cutoff        26  filter cutoff (exponential)
         VCF     reso          23  filter resonance

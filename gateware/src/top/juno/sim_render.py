@@ -60,6 +60,29 @@ def saw_table(amplitude=0.9):
     return [int(amplitude * 32767 * (2.0 * i / WT_SIZE - 1.0)) for i in range(WT_SIZE)]
 
 
+def juno_table(saw=True, pulse=False, pw=0.0):
+    """Mirror of the firmware `Waveform::Juno` generator (fw/src/wavetable.rs):
+    curved ramp p * (1 + 0.15 (1 - p)); pulse = comparator on the ramp with
+    threshold 0.5 + 0.46 * pw; saw + pulse mixed 50/50. Keep both in sync."""
+    table = []
+    threshold = 0.5 + 0.46 * pw
+    for i in range(WT_SIZE):
+        p = i / WT_SIZE
+        ramp = p * (1 + 0.15 * (1 - p))
+        s_saw = 2 * ramp - 1
+        s_pulse = 1.0 if ramp >= threshold else -1.0
+        if saw and pulse:
+            v = (s_saw + s_pulse) / 2
+        elif saw:
+            v = s_saw
+        elif pulse:
+            v = s_pulse
+        else:
+            v = 0.0
+        table.append(max(-32768, min(32767, int(v * 32768))))
+    return table
+
+
 @dataclass
 class Note:
     voice: int
@@ -83,7 +106,7 @@ class Params:
     kbd:     float = 0.5
     mod_wheel: float = 0.0
     cutoff_cv_volts: float = 0.0   # CV in1, 1 V/oct
-    wavetable: list = field(default_factory=saw_table)
+    wavetable: list = field(default_factory=juno_table)  # firmware default: juno, saw only
 
 
 def render(notes, seconds, params=None, n_voices=N_VOICES):
@@ -171,6 +194,14 @@ SCENES = {
                     Params(cutoff=0.3, env_amt=0.55, kbd=0.5,
                            attack=adsr_ui_to_rate(4000), decay=adsr_ui_to_rate(6000),
                            sustain=45000, release=adsr_ui_to_rate(3000))),
+    # Juno DCO mixer: same phrase with saw, square, narrow pulse, saw+pulse
+    "dco_saw":    (lambda s: [Note(0, 48, 0.0, s * 0.8)], Params(cutoff=0.6, env_amt=0.2)),
+    "dco_square": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
+                   Params(cutoff=0.6, env_amt=0.2, wavetable=juno_table(False, True, 0.0))),
+    "dco_narrow": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
+                   Params(cutoff=0.6, env_amt=0.2, wavetable=juno_table(False, True, 0.8))),
+    "dco_saw_pulse": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
+                      Params(cutoff=0.6, env_amt=0.2, wavetable=juno_table(True, True, 0.5))),
     # same chord, dark vs bright cutoff knob (no env), back to back
     "cutoff_dark": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),

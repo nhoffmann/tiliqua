@@ -2,7 +2,7 @@ use fixed::{FixedI32, types::extra::U16};
 use trig_const::{sin, exp};
 
 use crate::Polysynth0;
-use crate::options::{ProcMode, Waveform};
+use crate::options::{ProcMode, Switch, Waveform};
 
 // Q16.16 fixed-point used for wavetable calculation / processing
 pub type Fix32 = FixedI32<U16>;
@@ -39,10 +39,48 @@ static TANH_LUT: [Fix32; TANH_LUT_LEN] = {
 };
 
 
-pub fn wt_sample(waveform: Waveform, i: usize, cl: usize) -> Fix32 {
+/// Juno DCO mixer settings (DCO page), used by `Waveform::Juno`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Dco {
+    pub saw: bool,
+    pub pulse: bool,
+    /// 0..32768: 0 = square, max = narrow pulse
+    pub pw: u16,
+}
+
+impl Dco {
+    pub fn new(saw: Switch, pulse: Switch, pw: u16) -> Self {
+        Self { saw: saw == Switch::On, pulse: pulse == Switch::On, pw }
+    }
+}
+
+// Juno capacitor-ramp DCO: the ramp bows upward a little,
+// ramp(p) = p * (1 + 0.15 * (1 - p)), so ramp(0) = 0 and ramp(1) = 1.
+const RAMP_CURVE: Fix32 = Fix32::from_bits(9830);      // 0.15
+// Pulse = comparator on the curved ramp; threshold 0.5 (square) .. 0.96 (narrow).
+const PW_THRESHOLD_MIN: Fix32 = Fix32::from_bits(32768);   // 0.5
+const PW_THRESHOLD_SPAN: Fix32 = Fix32::from_bits(30147);  // 0.46
+
+fn juno_sample(dco: &Dco, phase: Fix32) -> Fix32 {
+    let ramp = phase * (Fix32::ONE + RAMP_CURVE * (Fix32::ONE - phase));
+    let saw = ramp * 2 - Fix32::ONE;
+    // pw / 32768 as Q16.16 (bits = pw * 2); from_num(32768) would overflow Q16.16
+    let pw_frac = Fix32::from_bits(i32::from(dco.pw) * 2);
+    let threshold = PW_THRESHOLD_MIN + PW_THRESHOLD_SPAN * pw_frac;
+    let pulse = if ramp >= threshold { Fix32::ONE - Fix32::DELTA } else { -Fix32::ONE + Fix32::DELTA };
+    match (dco.saw, dco.pulse) {
+        (true, true) => (saw + pulse) / 2,
+        (true, false) => saw,
+        (false, true) => pulse,
+        (false, false) => Fix32::ZERO,
+    }
+}
+
+pub fn wt_sample(waveform: Waveform, dco: &Dco, i: usize, cl: usize) -> Fix32 {
     // phase from 0->1
     let phase = Fix32::from_num(i) / cl as i32;
     match waveform {
+        Waveform::Juno => juno_sample(dco, phase),
         Waveform::Saw => {
             phase * 2 - Fix32::ONE
         }
@@ -129,21 +167,21 @@ fn gain_from_amt(proc_amt: u16) -> Fix32 {
     Fix32::from_num(proc_amt) / 10
 }
 
-pub fn wt_preview(buf: &mut [i16], waveform: Waveform,
+pub fn wt_preview(buf: &mut [i16], waveform: Waveform, dco: &Dco,
                   proc_mode: ProcMode, proc_amt: u16) {
     let gain = gain_from_amt(proc_amt);
     let cl = CYCLE_LEN;
     let len = buf.len();
     for (i, b) in buf.iter_mut().enumerate() {
         let idx = i * cl / len;
-        let sample = wt_sample(waveform, idx, cl);
+        let sample = wt_sample(waveform, dco, idx, cl);
         *b = to_asq(wt_apply_proc(sample, proc_mode, gain));
     }
 }
 
 pub fn wt_lfo(phase: &mut Fix32, phase_inc: Fix32, depth: Fix32, waveform: Waveform) -> i16 {
     let idx = phase.to_num::<usize>() % CYCLE_LEN;
-    let sample = wt_sample(waveform, idx, CYCLE_LEN) * depth;
+    let sample = wt_sample(waveform, &Dco::default(), idx, CYCLE_LEN) * depth;
     *phase += phase_inc;
     let cycle_len = Fix32::from_num(CYCLE_LEN);
     if *phase >= cycle_len {
@@ -152,11 +190,11 @@ pub fn wt_lfo(phase: &mut Fix32, phase_inc: Fix32, depth: Fix32, waveform: Wavef
     to_asq(sample)
 }
 
-pub fn wt_write(synth: &mut Polysynth0, waveform: Waveform,
+pub fn wt_write(synth: &mut Polysynth0, waveform: Waveform, dco: &Dco,
                 proc_mode: ProcMode, proc_amt: u16) {
     let gain = gain_from_amt(proc_amt);
     for i in 0..CYCLE_LEN {
-        let sample = wt_sample(waveform, i, CYCLE_LEN);
+        let sample = wt_sample(waveform, dco, i, CYCLE_LEN);
         let shaped = wt_apply_proc(sample, proc_mode, gain);
         synth.write_wavetable_sample(i as u16, to_asq(shaped));
     }

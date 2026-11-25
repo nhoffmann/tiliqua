@@ -187,15 +187,13 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         }
 
         // Wavetable update on parameter change
-        if opts.voice.waveform.value != app.last_waveform
-            || opts.voice.proc.value != app.last_proc_mode
-            || opts.voice.proc_amt.value != app.last_proc_amt
-        {
-            wavetable::wt_write(&mut app.synth, opts.voice.waveform.value,
+        let dco = wavetable::Dco::new(opts.dco.saw.value, opts.dco.pulse.value, opts.dco.pw.value);
+        let wt_params = (opts.voice.waveform.value, opts.voice.proc.value,
+                         opts.voice.proc_amt.value, dco);
+        if app.last_wt_params != Some(wt_params) {
+            app.last_wt_params = Some(wt_params);
+            wavetable::wt_write(&mut app.synth, opts.voice.waveform.value, &dco,
                                 opts.voice.proc.value, opts.voice.proc_amt.value);
-            app.last_waveform = opts.voice.waveform.value;
-            app.last_proc_mode = opts.voice.proc.value;
-            app.last_proc_amt = opts.voice.proc_amt.value;
         }
     });
 }
@@ -224,6 +222,10 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(23, global_index(opts, &opts.vcf.reso),        CcMapMode::Absolute);
     m.add(24, global_index(opts, &opts.voice.lfo_rate),  CcMapMode::Absolute);
     m.add(25, global_index(opts, &opts.voice.lfo_depth), CcMapMode::Absolute);
+    // DCO page (CC 17-19)
+    m.add(17, global_index(opts, &opts.dco.saw),         CcMapMode::Absolute);
+    m.add(18, global_index(opts, &opts.dco.pulse),       CcMapMode::Absolute);
+    m.add(19, global_index(opts, &opts.dco.pw),          CcMapMode::Absolute);
     // VCF page (CC 23, 26-29)
     m.add(26, global_index(opts, &opts.vcf.cutoff),      CcMapMode::Absolute);
     m.add(27, global_index(opts, &opts.vcf.env_amt),     CcMapMode::Absolute);
@@ -254,9 +256,8 @@ struct App {
     // last mod wheel (CC1) value, 0..127
     mod_wheel: u8,
     // wavetable state
-    last_waveform: Waveform,
-    last_proc_mode: ProcMode,
-    last_proc_amt: u16,
+    // last written wavetable params (None = not written yet)
+    last_wt_params: Option<(Waveform, ProcMode, u16, wavetable::Dco)>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
     // lfo phase accumulator
@@ -280,9 +281,7 @@ impl App {
             diffusion_smoother,
             cutoff_smoother,
             mod_wheel: 0,
-            last_waveform: Waveform::default(),
-            last_proc_mode: ProcMode::default(),
-            last_proc_amt: 0,
+            last_wt_params: None,
             cc_mapper,
             lfo_phase: wavetable::Fix32::ZERO,
         }
@@ -478,11 +477,13 @@ fn main() -> ! {
                         HUE,
                         highlight).ok();
                 }
-                if opts.tracker.page.value == Page::Voice {
+                if opts.tracker.page.value == Page::Voice || opts.tracker.page.value == Page::Dco {
                     const PREVIEW_LEN: usize = 64;
                     let mut preview = [0i16; PREVIEW_LEN];
+                    let dco = wavetable::Dco::new(opts.dco.saw.value,
+                        opts.dco.pulse.value, opts.dco.pw.value);
                     wavetable::wt_preview(&mut preview,
-                        opts.voice.waveform.value, opts.voice.proc.value,
+                        opts.voice.waveform.value, &dco, opts.voice.proc.value,
                         opts.voice.proc_amt.value);
                     draw::draw_waveform_preview(&mut display,
                         h_active/2-190, 80,

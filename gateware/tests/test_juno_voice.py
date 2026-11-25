@@ -13,7 +13,7 @@ import unittest
 import numpy as np
 
 from top.juno.juno_voice import MultiSVF
-from top.juno.sim_render import FS, Note, Params, render
+from top.juno.sim_render import FS, Note, Params, juno_table, render
 
 
 def rms(x):
@@ -130,6 +130,37 @@ class JunoVoiceTests(unittest.TestCase):
         via_cv   = self._centroid(cutoff=0.4, env_amt=0.0, kbd=0.0, cutoff_cv_volts=1.0)
         via_knob = self._centroid(cutoff=0.5, env_amt=0.0, kbd=0.0)
         self.assertAlmostEqual(via_cv / via_knob, 1.0, delta=0.03)
+
+    # --- Juno DCO wavetable (mirror of the firmware generator) -------------------
+
+    def test_juno_table_shape(self):
+        """Curved saw: rises monotonically from -1 to ~+1 and bows upward
+        (mid-cycle above 0). Pulse duty: ~54 % at pw=0, ~4.5 % at pw=1 (matches the Rust generator)."""
+        saw = np.array(juno_table(True, False)) / 32768
+        self.assertTrue(np.all(np.diff(saw) > 0))
+        self.assertAlmostEqual(saw[0], -1.0, delta=0.01)
+        self.assertGreater(saw[-1], 0.99)
+        self.assertAlmostEqual(saw[len(saw) // 2], 0.075, delta=0.01)
+        for pw, duty in [(0.0, 0.537), (1.0, 0.045)]:
+            pulse = np.array(juno_table(False, True, pw))
+            self.assertAlmostEqual(np.mean(pulse > 0), duty, delta=0.01)
+
+    def test_dco_square_has_weak_even_harmonics(self):
+        """Rendered through the voice: the pw=0 pulse (near-square) has a much
+        weaker 2nd harmonic than the saw."""
+        def h2_over_h1(table):
+            p = Params(**self.FAST_FULL, cutoff=0.95, env_amt=0.0, kbd=0.0, wavetable=table)
+            out = render([Note(0, 69, 0.0, 1.0)], seconds=0.04, params=p)
+            x = out[len(out) // 3:, 0]
+            x = (x - x.mean()) * np.hanning(len(x))
+            mag = np.abs(np.fft.rfft(x))
+            f = np.fft.rfftfreq(len(x), 1 / FS)
+            h = lambda k: mag[np.argmin(np.abs(f - 440.0 * k))]
+            return h(2) / h(1)
+        saw = h2_over_h1(juno_table(True, False))
+        square = h2_over_h1(juno_table(False, True, 0.0))
+        self.assertGreater(saw, 0.3)
+        self.assertLess(square, saw / 3)
 
     def test_vca_zero_sustain_decays_while_held(self):
         """Sustain 0: the note dies away although the gate is still held (pluck)."""

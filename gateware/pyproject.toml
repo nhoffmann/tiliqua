@@ -50,6 +50,7 @@ _.env_file = ".env.toolchain"
 bootloader         = "src/top/bootloader/top.py"
 # (SoC bitstreams)
 polysyn            = "src/top/polysyn/top.py"
+juno               = "src/top/juno/top.py"
 selftest           = "src/top/selftest/top.py"
 xbeam              = "src/top/xbeam/top.py"
 macro_osc          = "src/top/macro_osc/top.py"

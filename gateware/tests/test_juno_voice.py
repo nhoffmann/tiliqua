@@ -24,7 +24,14 @@ from top.juno.juno_lfo import JunoLfo, JunoLfoModel
 from top.juno.osc_model import OscModel
 from top.juno.ladder_model import LadderModel
 from tiliqua.test import stream
-from top.juno.sim_render import FS, Note, Params, pw_knob_to_point, render
+from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
+from top.juno.sim_render import render as render_amaranth
+from top.juno import vl_render
+
+# Render-based tests use Verilator (bit-identical to amaranth.sim, see
+# test_verilator_engine_matches_amaranth, ~100x faster); amaranth.sim is the
+# fallback when verilator is not installed.
+render = vl_render.render_vl if vl_render.available() else render_amaranth
 
 
 def rms(x):
@@ -282,13 +289,12 @@ class JunoVoiceTests(unittest.TestCase):
         """vl_render (Verilator) is bit-identical with the amaranth.sim render:
         staggered notes + note-offs, PWM by LFO, vibrato, filter LFO, Gate mode,
         sub and noise."""
-        from top.juno.vl_render import render_vl
         notes = [Note(0, 48, 0.0, 0.015), Note(1, 55, 0.003, 0.025), Note(2, 64, 0.008, 0.02)]
         p = Params(attack=8192, decay=4096, sustain=30000, release=4096, pulse=True,
                    pw=0.6, pwm_lfo=True, dco_lfo_semi=1.0, vcf_lfo=0.2,
                    lfo_rate_hz=200.0, vca_gate=True, sub=0.5, noise=0.2)
-        a = render(notes, 0.025, p)
-        b = render_vl(notes, 0.025, p)
+        a = render_amaranth(notes, 0.025, p)
+        b = vl_render.render_vl(notes, 0.025, p)
         self.assertEqual(np.abs(a - b).max(), 0.0)
         self.assertGreater(np.abs(a).max(), 0.05)
 

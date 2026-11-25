@@ -3,8 +3,9 @@
 Fast offline renders of ``JunoCore`` with Verilator.
 
 Same inputs and bit-identical output as ``sim_render.render`` (amaranth.sim),
-but compiled: seconds instead of ~15 minutes per second of audio. Unit tests
-keep using amaranth.sim; ``tests/test_juno_voice.py`` checks both engines agree.
+but compiled: seconds instead of ~15 minutes per second of audio. The
+render-based tests in ``tests/test_juno_voice.py`` use it when Verilator is
+installed; ``test_verilator_engine_matches_amaranth`` checks both engines agree.
 
 The Verilog is generated from ``JunoCore`` and built with ``vl_harness.cpp`` into
 ``build/juno_vl/<hash>/``; the hash covers the Verilog, the harness and the
@@ -47,20 +48,28 @@ def build(n_voices=N_VOICES, verbose=False):
     binary = os.path.join(out_dir, "obj_dir", "Vjuno_core")
     if os.path.exists(binary):
         return binary
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "juno_core.v"), "w") as f:
+    # Build in a private directory and rename it into place, so parallel test
+    # workers (pytest -n auto) don't trample each other's build.
+    os.makedirs(BUILD_ROOT, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix=f"{key}-", dir=os.path.abspath(BUILD_ROOT))
+    with open(os.path.join(tmp_dir, "juno_core.v"), "w") as f:
         f.write(v)
-    shutil.copy(HARNESS, os.path.join(out_dir, "vl_harness.cpp"))
+    shutil.copy(HARNESS, os.path.join(tmp_dir, "vl_harness.cpp"))
     cmd = ["verilator", "--cc", "--exe", "--build", "-j", "0", "-O3",
            "--x-assign", "0", "--x-initial", "0",
            "-Wno-fatal", "-Wno-lint", "-Wno-style",
            "--top-module", "juno_core",
            "-CFLAGS", "-O2",
            "juno_core.v", "vl_harness.cpp"]
-    result = subprocess.run(cmd, cwd=out_dir, capture_output=True, text=True)
-    if result.returncode != 0 or not os.path.exists(binary):
+    result = subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(os.path.join(tmp_dir, "obj_dir", "Vjuno_core")):
         raise RuntimeError("verilator build failed:\n" + result.stdout[-4000:]
                            + result.stderr[-4000:])
+    try:
+        os.rename(tmp_dir, out_dir)
+    except OSError:
+        # another worker finished first: use its build
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     if verbose:
         print(f"built {binary}")
     return binary

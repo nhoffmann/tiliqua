@@ -41,6 +41,9 @@ const HUE: u8 = 10;
 const PERSIST: u8 = 15;
 const PERSIST_HELP: u8 = 64;
 
+// Mod wheel fully up opens the cutoff by 0.5 (5 octaves). Same as sim_render.py.
+const MOD_WHEEL_RANGE: i32 = 16384;
+
 fn adsr_ui_to_rate(ui_value: u16) -> u16 {
     // 0..32768 -> 1ms..2000ms -> hardware rate
     let ms_x32k = 32768u32 + u32::from(ui_value) * 1999;
@@ -69,8 +72,13 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         //
 
         let mut last_cc_index = None;
-        let midi_word = app.synth.midi_read();
-        if midi_word != 0 {
+        // Drain the whole read FIFO (depth 8) each tick, so fast CC streams
+        // (e.g. mod wheel sweeps) aren't dropped.
+        for _ in 0..8 {
+            let midi_word = app.synth.midi_read();
+            if midi_word == 0 {
+                break;
+            }
             // Blink MIDI activity LED on TRS port
             app.ui.midi_activity();
 
@@ -80,6 +88,11 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
                 ((midi_word >> 16) & 0xFF) as u8,
             ];
             if let Ok(MidiMessage::ControlChange(_, cc, val)) = MidiMessage::try_parse_slice(&bytes) {
+                // Mod wheel (CC1) opens the filter cutoff.
+                let cc_num: u8 = cc.into();
+                if cc_num == 1 {
+                    app.mod_wheel = val.into();
+                }
                 if let Some(action) = app.cc_mapper.process(cc.into(), val.into()) {
                     last_cc_index = Some(action.global_index);
                     apply_cc_action(&mut app.ui.opts, &action);
@@ -109,7 +122,7 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_drive(drive_smooth);
 
         // Map 0-1 UI range to 32768-8192 hardware range (inverted)
-        let reso_ui = u32::from(opts.voice.reso.value);
+        let reso_ui = u32::from(opts.vcf.reso.value);
         let reso_hw = (32768 - reso_ui * 24576 / 32768) as u16;
         let reso_smooth = app.reso_smoother.proc_u16(reso_hw);
         app.synth.set_reso(reso_smooth);
@@ -127,6 +140,28 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_matrix_coefficient(1, 5, coeff_wet);
         app.synth.set_matrix_coefficient(2, 6, coeff_wet);
         app.synth.set_matrix_coefficient(3, 7, coeff_wet);
+
+        // Exponential cutoff (normalized octaves, 32768 = 1.0 = 10 octaves).
+        // Per voice: knob + keyboard tracking (relative to C4) + mod wheel.
+        // Env amount (bipolar) and CV in1 are added per sample in gateware.
+        {
+            let cutoff = i32::from(app.cutoff_smoother.proc_u16(opts.vcf.cutoff.value));
+            let kbd = i32::from(opts.vcf.kbd_track.value);
+            let mod_off = i32::from(app.mod_wheel) * MOD_WHEEL_RANGE / 127;
+            let notes = app.synth.voice_notes();
+            for (voice, note) in notes.iter().enumerate() {
+                // kbd * (note - 60) / 12 octaves, 1 octave = 1/10 = 3276.8 raw
+                let track = kbd * (i32::from(*note) - 60) / 120;
+                let base = (cutoff + track + mod_off).clamp(-32768, 32767);
+                app.synth.set_cutoff_base(voice, base as i16);
+            }
+            let amt = i32::from(opts.vcf.env_amt.value).min(32767);
+            let amt = match opts.vcf.env_pol.value {
+                EnvPolarity::Pos => amt,
+                EnvPolarity::Neg => -amt,
+            };
+            app.synth.set_env_amt(amt as i16);
+        }
 
         app.synth.set_midi_channel_filter(opts.misc.midi_ch.value.to_filter());
 
@@ -186,9 +221,14 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(20, global_index(opts, &opts.voice.waveform),  CcMapMode::Absolute);
     m.add(21, global_index(opts, &opts.voice.proc),      CcMapMode::Absolute);
     m.add(22, global_index(opts, &opts.voice.proc_amt),  CcMapMode::Absolute);
-    m.add(23, global_index(opts, &opts.voice.reso),      CcMapMode::Absolute);
+    m.add(23, global_index(opts, &opts.vcf.reso),        CcMapMode::Absolute);
     m.add(24, global_index(opts, &opts.voice.lfo_rate),  CcMapMode::Absolute);
     m.add(25, global_index(opts, &opts.voice.lfo_depth), CcMapMode::Absolute);
+    // VCF page (CC 23, 26-29)
+    m.add(26, global_index(opts, &opts.vcf.cutoff),      CcMapMode::Absolute);
+    m.add(27, global_index(opts, &opts.vcf.env_amt),     CcMapMode::Absolute);
+    m.add(28, global_index(opts, &opts.vcf.env_pol),     CcMapMode::Absolute);
+    m.add(29, global_index(opts, &opts.vcf.kbd_track),   CcMapMode::Absolute);
     // ADSR page (CC 30-33)
     m.add(30, global_index(opts, &opts.adsr.attack),  CcMapMode::Absolute);
     m.add(31, global_index(opts, &opts.adsr.decay),   CcMapMode::Absolute);
@@ -210,6 +250,9 @@ struct App {
     drive_smoother: OnePoleSmoother,
     reso_smoother: OnePoleSmoother,
     diffusion_smoother: OnePoleSmoother,
+    cutoff_smoother: OnePoleSmoother,
+    // last mod wheel (CC1) value, 0..127
+    mod_wheel: u8,
     // wavetable state
     last_waveform: Waveform,
     last_proc_mode: ProcMode,
@@ -225,6 +268,7 @@ impl App {
         let drive_smoother = OnePoleSmoother::new(0.05f32);
         let reso_smoother = OnePoleSmoother::new(0.05f32);
         let diffusion_smoother = OnePoleSmoother::new(0.05f32);
+        let cutoff_smoother = OnePoleSmoother::new(0.05f32);
         let cc_mapper = build_cc_mapper(&ui.opts);
         synth.usb_host_midi(1, 1);
         synth.usb_host_vbus(false); // default, but set anyway...
@@ -234,6 +278,8 @@ impl App {
             drive_smoother,
             reso_smoother,
             diffusion_smoother,
+            cutoff_smoother,
+            mod_wheel: 0,
             last_waveform: Waveform::default(),
             last_proc_mode: ProcMode::default(),
             last_proc_amt: 0,

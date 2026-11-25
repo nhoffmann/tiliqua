@@ -38,6 +38,8 @@ from amaranth.lib import data, enum, stream, wiring
 from amaranth.lib.memory import Memory
 from amaranth.lib.wiring import In, Out
 
+import math
+
 from amaranth.utils import exact_log2
 from amaranth_future import fixed
 
@@ -367,16 +369,49 @@ class MultiSVF(wiring.Component):
 
     """
     N oversampled Chamberlin state variable filters with:
-    - Per-voice samples in and cutoff (envelope)
+    - Per-voice samples in and envelope
     - Global resonance (all filters)
     - LPF output has a DC-blocking stage so 0 cutoff doesn't emit DC
-    - Per-voice VCA after the DC block: output = filtered * env (Juno port addition,
-      uses the same multiplier, no extra DSP tile)
+    - Per-voice VCA after the DC block: output = filtered * env
 
-    This is just N copies of the one-in-one-out ``SVF`` and ``DCBlock`` from ``dsp.filters``.
+    Juno port additions (all on the same multiplier, no extra DSP tile):
+
+    - Exponential cutoff. Per voice, a cutoff control ``c`` in 'normalized octaves'
+      (0..1 spans ``CUTOFF_OCTAVES`` octaves above ``CUTOFF_F_MIN``) is computed as::
+
+          c = voice_cutoff_base[n] + env_amt * env + 0.8192 * cutoff_cv
+
+      ``voice_cutoff_base`` comes from firmware (knob + keyboard tracking + mod wheel),
+      ``env_amt`` is bipolar, and the CV scaling makes 1 V = 1 octave (ASQ 1.0 = 8.192 V).
+      ``c`` is clamped to [0, 1) and converted to the SVF coefficient by a lookup table.
+    - VCA after the DC block: output = filtered * env.
+
+    Otherwise this is N copies of the one-in-one-out ``SVF`` and ``DCBlock`` from ``dsp.filters``.
     """
 
     N_OVERSAMPLE = 2
+
+    # Exponential cutoff mapping: c in [0, 1) -> CUTOFF_F_MIN * 2**(c * CUTOFF_OCTAVES) Hz.
+    CUTOFF_F_MIN   = 12.0
+    CUTOFF_OCTAVES = 10
+    CUTOFF_LUT_BITS = 10
+    FS = 48000
+
+    @classmethod
+    def cutoff_hz(cls, c):
+        return cls.CUTOFF_F_MIN * 2 ** (c * cls.CUTOFF_OCTAVES)
+
+    @classmethod
+    def cutoff_lut(cls):
+        """SVF coefficient f = 2 sin(pi fc / fs_oversampled), raw SQNative values."""
+        size = 1 << cls.CUTOFF_LUT_BITS
+        fs_os = cls.FS * cls.N_OVERSAMPLE
+        lut = []
+        for i in range(size):
+            fc = cls.cutoff_hz(i / size)
+            lut.append(fixed.Const(2 * math.sin(math.pi * fc / fs_os),
+                                   shape=mac.SQNative)._value)
+        return lut
 
     def __init__(self, n, sq=ASQ, env_uq=MultiADSR.EnvUQ, macp=None):
         self.n = n
@@ -385,6 +420,9 @@ class MultiSVF(wiring.Component):
         super().__init__({
             "i":    In(stream.Signature(Block(data.StructLayout({"x": sq, "env": env_uq})))),
             "reso": In(unsigned(16)),
+            "voice_cutoff_base": In(data.ArrayLayout(ASQ, n)),
+            "env_amt":    In(ASQ),
+            "cutoff_cv":  In(ASQ),
             "o":    Out(stream.Signature(Block(sq))),
         })
 
@@ -425,9 +463,28 @@ class MultiSVF(wiring.Component):
         dc_x = Signal(svf_sh)
         dc_y = Signal(svf_sh)
 
-        # VCA: the same per-voice envelope that sets the cutoff scales the output.
+        # VCA: the per-voice envelope scales the output.
         vca_env = Signal(mac.SQNative)
         vca_out = Signal(svf_sh)
+
+        # Exponential cutoff: c = base + env_amt * env + cv (normalized octaves)
+        cut_base = Signal(mac.SQNative)
+        cut_amt  = Signal(mac.SQNative)
+        cut_cv   = Signal(mac.SQNative)
+        cut_c    = Signal(mac.SQNative)
+        m.d.comb += [
+            cut_amt.eq(self.env_amt),
+            # 0.8192 ~= 1 - 1/8 - 1/16 + 1/128 (0.13 % error): 1 V/oct on the CV input
+            cut_cv.eq(self.cutoff_cv - (self.cutoff_cv >> 3) - (self.cutoff_cv >> 4)
+                      + (self.cutoff_cv >> 7)),
+        ]
+        lut = self.cutoff_lut()
+        m.submodules.cutoff_lut = cutoff_mem = Memory(
+            shape=signed(mac.SQNative.as_shape().width), depth=len(lut), init=lut)
+        lut_rport = cutoff_mem.read_port()
+        m.d.comb += lut_rport.en.eq(1)
+        idx_shift = mac.SQNative.f_bits - self.CUTOFF_LUT_BITS
+        idx_max = len(lut) - 1
 
         in_first = Signal(1)
         voice_ix = Signal(range(N))
@@ -439,7 +496,6 @@ class MultiSVF(wiring.Component):
                 with m.If(self.i.valid):
                     m.d.sync += [
                         svf_x.eq(self.i.payload.sample.x >> 1),
-                        svf_kK.as_value().eq(self.i.payload.sample.env.as_value() >> 3),
                         vca_env.eq(self.i.payload.sample.env),
                         svf_kQinv.as_value().eq(self.reso),
                         in_first.eq(self.i.payload.first),
@@ -456,6 +512,31 @@ class MultiSVF(wiring.Component):
                     dc_x.eq(st_rport.data.dc_x),
                     dc_y.eq(st_rport.data.dc_y),
                 ]
+                with m.Switch(voice_ix):
+                    for n in range(N):
+                        with m.Case(n):
+                            m.d.sync += cut_base.eq(self.voice_cutoff_base[n])
+                m.next = 'CUTOFF-MUL'
+
+            with m.State('CUTOFF-MUL'):
+                # c = base + env_amt * env + cv
+                with mp.Multiply(m, a=vca_env, b=cut_amt):
+                    m.d.sync += cut_c.eq(cut_base + mp.result.z + cut_cv)
+                    m.next = 'CUTOFF-ADDR'
+
+            with m.State('CUTOFF-ADDR'):
+                # clamp c to [0, 1) and look up the SVF coefficient
+                c_raw = cut_c.as_value()
+                with m.If(c_raw < 0):
+                    m.d.comb += lut_rport.addr.eq(0)
+                with m.Elif((c_raw >> idx_shift) > idx_max):
+                    m.d.comb += lut_rport.addr.eq(idx_max)
+                with m.Else():
+                    m.d.comb += lut_rport.addr.eq(c_raw >> idx_shift)
+                m.next = 'CUTOFF-READ'
+
+            with m.State('CUTOFF-READ'):
+                m.d.sync += svf_kK.as_value().eq(lut_rport.data)
                 m.next = 'SVF-MAC0'
 
             with m.State('SVF-MAC0'):
@@ -608,6 +689,11 @@ class JunoVoice(wiring.Component):
 
             # Global synth parameters (from CSR)
             "reso":           In(unsigned(16)),
+            # Exponential cutoff (see MultiSVF): per-voice base from firmware,
+            # bipolar env amount, cutoff CV (1 V/oct)
+            "voice_cutoff_base": In(data.ArrayLayout(ASQ, self.n_voices)),
+            "env_amt":        In(ASQ),
+            "cutoff_cv":      In(ASQ),
             "attack_rate":    In(MultiADSR.EnvUQ),
             "decay_rate":     In(MultiADSR.EnvUQ),
             "sustain_level":  In(MultiADSR.EnvUQ),
@@ -647,6 +733,7 @@ class JunoVoice(wiring.Component):
                 adsr.voice_gates[n].eq(self.voice_gates[n]),
                 adsr.voice_velocity[n].eq(self.voice_velocity[n]),
                 self.voice_active[n].eq(adsr.voice_active[n]),
+                svf.voice_cutoff_base[n].eq(self.voice_cutoff_base[n]),
             ]
         m.d.comb += [
             osc.wt_write_addr.eq(self.wt_write_addr),
@@ -658,6 +745,8 @@ class JunoVoice(wiring.Component):
             adsr.sustain_level.eq(self.sustain_level),
             adsr.release_rate.eq(self.release_rate),
             svf.reso.eq(self.reso),
+            svf.env_amt.eq(self.env_amt),
+            svf.cutoff_cv.eq(self.cutoff_cv),
         ]
 
         # Stream pipeline

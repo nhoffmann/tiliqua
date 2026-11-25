@@ -27,7 +27,7 @@ from amaranth_future import fixed
 from tiliqua.dsp import ASQ
 from tiliqua.test import stream
 
-from top.juno.juno_voice import JunoVoice, MultiADSR
+from top.juno.juno_voice import JunoVoice, MultiADSR, MultiSVF
 
 FS = 48000
 N_VOICES = 6
@@ -43,6 +43,17 @@ def adsr_ui_to_rate(ui_value):
     """Same mapping as the firmware (main.rs): UI 0..32768 -> 1 ms..2000 ms."""
     ms_x32k = 32768 + ui_value * 1999
     return min(45_000_000 // ms_x32k, 65535)
+
+
+def cutoff_base(cutoff, kbd, note, mod_wheel=0.0):
+    """Per-voice cutoff base, same formula as the firmware (normalized octaves):
+    knob + keyboard tracking relative to C4 (note 60) + mod wheel offset."""
+    octave = 1.0 / MultiSVF.CUTOFF_OCTAVES
+    return cutoff + kbd * (note - 60) / 12 * octave + mod_wheel * MOD_WHEEL_RANGE
+
+
+# Mod wheel fully up opens the cutoff by this much (normalized octaves).
+MOD_WHEEL_RANGE = 0.5
 
 
 def saw_table(amplitude=0.9):
@@ -66,6 +77,12 @@ class Params:
     sustain: int = 16384 * 65535 // 32768
     release: int = adsr_ui_to_rate(4096)
     reso:    int = 32768 - 16384 * 24576 // 32768
+    # Exponential cutoff (normalized octaves, see MultiSVF); firmware defaults
+    cutoff:  float = 0.35
+    env_amt: float = 0.6
+    kbd:     float = 0.5
+    mod_wheel: float = 0.0
+    cutoff_cv_volts: float = 0.0   # CV in1, 1 V/oct
     wavetable: list = field(default_factory=saw_table)
 
 
@@ -98,6 +115,8 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
         ctx.set(dut.sustain_level.as_value(), params.sustain)
         ctx.set(dut.release_rate.as_value(), params.release)
         ctx.set(dut.reso, params.reso)
+        ctx.set(dut.env_amt, fixed.Const(params.env_amt, shape=ASQ))
+        ctx.set(dut.cutoff_cv, fixed.Const(params.cutoff_cv_volts / 8.192, shape=ASQ))
         await ctx.tick()
 
         ev = 0
@@ -109,6 +128,9 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
                             fixed.Const(note_to_freq_inc(note.note), shape=ASQ))
                     ctx.set(dut.voice_velocity[note.voice],
                             fixed.Const(note.velocity, shape=EnvUQ))
+                    base = cutoff_base(params.cutoff, params.kbd, note.note, params.mod_wheel)
+                    ctx.set(dut.voice_cutoff_base[note.voice],
+                            fixed.Const(max(-1.0, min(base, 0.99997)), shape=ASQ))
                 ctx.set(dut.voice_gates[note.voice], gate)
                 ev += 1
             sample = await stream.get(ctx, dut.o)
@@ -129,14 +151,31 @@ def write_wav(path, audio):
 
 
 SCENES = {
-    # single held note, then release
-    "single_c3": lambda s: [Note(0, 48, 0.0, s * 0.6)],
+    # name: (seconds -> notes, params)
+    # single held note, then release (firmware default sound)
+    "single_c3": (lambda s: [Note(0, 48, 0.0, s * 0.6)], Params()),
     # C minor chord on 3 voices (2 left, 1 right)
-    "chord_cmin": lambda s: [Note(0, 48, 0.0, s * 0.6), Note(1, 51, 0.0, s * 0.6),
-                             Note(2, 55, 0.0, s * 0.6)],
+    "chord_cmin": (lambda s: [Note(0, 48, 0.0, s * 0.6), Note(1, 51, 0.0, s * 0.6),
+                              Note(2, 55, 0.0, s * 0.6)], Params()),
     # short staccato notes, one per voice
-    "staccato": lambda s: [Note(v, 48 + 2 * v, v * s / 6, v * s / 6 + s / 12)
-                           for v in range(N_VOICES)],
+    "staccato": (lambda s: [Note(v, 48 + 2 * v, v * s / 6, v * s / 6 + s / 12)
+                            for v in range(N_VOICES)], Params()),
+    # plucky bass: dark filter, strong env amount, zero sustain
+    "pluck_bass": (lambda s: [Note(v % 2, n, i * s / 4, i * s / 4 + s / 5)
+                              for i, (v, n) in enumerate(zip(range(4), [36, 36, 43, 39]))],
+                   Params(cutoff=0.2, env_amt=0.7, kbd=0.3, sustain=0,
+                          decay=adsr_ui_to_rate(2500), release=adsr_ui_to_rate(1500))),
+    # slow attack brassy swell: filter opens with the envelope
+    "brass_swell": (lambda s: [Note(0, 48, 0.0, s * 0.7), Note(1, 55, 0.0, s * 0.7),
+                               Note(2, 60, 0.0, s * 0.7)],
+                    Params(cutoff=0.3, env_amt=0.55, kbd=0.5,
+                           attack=adsr_ui_to_rate(4000), decay=adsr_ui_to_rate(6000),
+                           sustain=45000, release=adsr_ui_to_rate(3000))),
+    # same chord, dark vs bright cutoff knob (no env), back to back
+    "cutoff_dark": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
+                    Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),
+    "cutoff_bright": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
+                      Params(cutoff=0.75, env_amt=0.0, kbd=0.5)),
 }
 
 
@@ -149,7 +188,8 @@ def main():
     args = parser.parse_args()
     for name in args.scenes:
         t0 = time.time()
-        audio = render(SCENES[name](args.seconds), args.seconds)
+        notes, params = SCENES[name]
+        audio = render(notes(args.seconds), args.seconds, params)
         path = os.path.join(args.out, f"{name}.wav")
         write_wav(path, audio)
         print(f"{path}: {len(audio)} samples, peak {np.abs(audio).max():.3f}, "

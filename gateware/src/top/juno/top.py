@@ -9,7 +9,7 @@
               Audio / CV
            ┌────┐
            │in0 │◄─ phase modulation
-           │in1 │◄─ filter envelope
+           │in1 │◄─ filter cutoff (1V/oct)
            │in2 │◄─ drive
            │in3 │◄─ -
            └────┘
@@ -25,7 +25,11 @@ supported, selected on the MISC page).
 
     - Voice mix is sent to output channels 2 and 3 (last 2 jacks).
 
-    - The velocity of each note and mod wheel affects the filter envelopes.
+    - Note velocity scales each voice's envelope (filter and VCA).
+
+    - Filter cutoff is exponential (Juno-style): cutoff knob + keyboard tracking +
+      mod wheel (computed per voice by firmware) + env amount x envelope + CV in1
+      (1V/oct, computed per voice in gateware). The envelope also drives a per-voice VCA.
 
     - When a jack is patched into input 0, 1 or 2, CV can be used to modulate
       all voices simultaneously up to audio rate (phase mod, filter cutoff and
@@ -90,14 +94,19 @@ can also be used to control most of these through CCs as follows:
         VOICE   waveform      20  wavetable selection
         VOICE   proc          21  wavetable processing mode
         VOICE   proc-amt      22  wavetable processing amount
-        VOICE   reso          23  filter resonance
+
+        VCF     cutoff        26  filter cutoff (exponential)
+        VCF     reso          23  filter resonance
+        VCF     env-amt       27  envelope -> cutoff amount
+        VCF     env-pol       28  envelope polarity (+/-)
+        VCF     kbd-track     29  keyboard tracking (0 = off, 1 = 100 %)
         VOICE   lfo-rate      24  phase modulation LFO rate
         VOICE   lfo-depth     25  phase modulation LFO depth
 
-        ADSR    attack        30  filter envelope attack
-        ADSR    decay         31  filter envelope decay
-        ADSR    sustain       32  filter envelope sustain
-        ADSR    release       33  filter envelope release
+        ADSR    attack        30  envelope attack (VCF + VCA)
+        ADSR    decay         31  envelope decay
+        ADSR    sustain       32  envelope sustain
+        ADSR    release       33  envelope release
 
         EFFECT  drive         40  distortion amount
         EFFECT  diffuse       41  diffusion wet/dry mix
@@ -109,7 +118,7 @@ can also be used to control most of these through CCs as follows:
         MISC    save-opts      -  save all options to flash
         MISC    wipe-opts      -  reset all options to defaults
 
-    MIDI CC 1 (mod wheel) controls filter cutoff. CC 64 (sustain
+    MIDI CC 1 (mod wheel) opens the filter cutoff. CC 64 (sustain
     pedal) holds voices. Pitch bend is also supported.
 
 """
@@ -184,6 +193,7 @@ class PolySynth(wiring.Component):
 
     drive: In(unsigned(16))
     reso: In(unsigned(16))
+    env_amt: In(ASQ)
     attack_rate: In(MultiADSR.EnvUQ)
     decay_rate: In(MultiADSR.EnvUQ)
     sustain_level: In(MultiADSR.EnvUQ)
@@ -199,6 +209,9 @@ class PolySynth(wiring.Component):
     # Jack detection (directly from pmod hardware)
     jack: In(unsigned(8))
 
+    # Per-voice cutoff base (firmware: knob + keyboard tracking + mod wheel)
+    voice_cutoff_base: In(ASQ).array(N_VOICES)
+
     voice_states: Out(midi.MidiVoice).array(N_VOICES)
     voice_cutoffs: Out(unsigned(8)).array(N_VOICES)
 
@@ -211,7 +224,7 @@ class PolySynth(wiring.Component):
         n_voices = self.N_VOICES
 
         m.submodules.voice_tracker = voice_tracker = midi.MidiVoiceTracker(
-            max_voices=n_voices, velocity_mod=True, zero_velocity_gate=False)
+            max_voices=n_voices, velocity_mod=False, zero_velocity_gate=False)
 
         # Connect MIDI stream -> voice tracker
         wiring.connect(m, wiring.flipped(self.i_midi), voice_tracker.i)
@@ -246,23 +259,26 @@ class PolySynth(wiring.Component):
 
         # per-voice params
         for n in range(n_voices):
-            # CV 1: filter envelope bipolar offset (when jack 1 patched)
-            vel_base = fixed.UQ(0, 8)(voice_tracker.o[n].velocity_mod)
-            vel_sum = vel_base + cv[1]
+            # Note velocity scales the envelope (VCF + VCA). The mod wheel no longer
+            # caps it (velocity_mod=False), otherwise CC1=0 would mute the VCA.
             vel_out = Signal(MultiADSR.EnvUQ, name=f"vel_out_{n}")
-            m.d.comb += vel_out.eq(vel_sum.saturate(MultiADSR.EnvUQ))
+            m.d.comb += vel_out.eq(fixed.UQ(0, 8)(voice_tracker.o[n].velocity_mod))
             m.d.comb += [
                 self.voice_states[n].eq(voice_tracker.o[n]),
                 self.voice_cutoffs[n].eq(voice_block.voice_cutoffs[n]),
                 voice_block.voice_gates[n].eq(voice_tracker.o[n].gate),
                 voice_block.voice_freq_incs[n].eq(voice_tracker.o[n].freq_inc),
                 voice_block.voice_velocity[n].eq(vel_out),
+                voice_block.voice_cutoff_base[n].eq(self.voice_cutoff_base[n]),
                 voice_tracker.voice_active[n].eq(voice_block.voice_active[n]),
             ]
 
         # global params
         m.d.comb += [
             voice_block.reso.eq(self.reso),
+            voice_block.env_amt.eq(self.env_amt),
+            # CV 1: filter cutoff, 1V/oct (when jack 1 patched)
+            voice_block.cutoff_cv.eq(Mux(self.jack[1], cv[1], 0)),
             voice_block.attack_rate.eq(self.attack_rate),
             voice_block.decay_rate.eq(self.decay_rate),
             voice_block.sustain_level.eq(self.sustain_level),
@@ -351,6 +367,12 @@ class SynthPeripheral(wiring.Component):
     class WavetableData(csr.Register, access="w"):
         value: csr.Field(csr.action.W, signed(16))
 
+    class EnvAmt(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, signed(16))
+
+    class CutoffBase(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, signed(16))
+
     class Voice(csr.Register, access="r"):
         note:   csr.Field(csr.action.R, unsigned(8))
         cutoff: csr.Field(csr.action.R, unsigned(8))
@@ -406,6 +428,9 @@ class SynthPeripheral(wiring.Component):
         self._wt_data       = regs.add("wt_data",       self.WavetableData(), offset=voices_csr_end + 0x30)
         self._lfo           = regs.add("lfo",           self.Lfo(),           offset=voices_csr_end + 0x34)
         self._midi_ch_filt  = regs.add("midi_ch_filter",self.MidiChannelFilter(), offset=voices_csr_end + 0x38)
+        self._env_amt       = regs.add("env_amt",       self.EnvAmt(),        offset=voices_csr_end + 0x3C)
+        self._cutoff_base   = [regs.add(f"cutoff_base{i}", self.CutoffBase(),
+                               offset=voices_csr_end + 0x40 + i*4) for i in range(PolySynth.N_VOICES)]
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -426,6 +451,11 @@ class SynthPeripheral(wiring.Component):
             m.d.sync += self.synth.drive.eq(self._drive.f.value.w_data)
         with m.If(self._reso.f.value.w_stb):
             m.d.sync += self.synth.reso.eq(self._reso.f.value.w_data)
+        with m.If(self._env_amt.f.value.w_stb):
+            m.d.sync += self.synth.env_amt.as_value().eq(self._env_amt.f.value.w_data)
+        for i, reg in enumerate(self._cutoff_base):
+            with m.If(reg.f.value.w_stb):
+                m.d.sync += self.synth.voice_cutoff_base[i].as_value().eq(reg.f.value.w_data)
 
         # ADSR parameters
         with m.If(self._attack_rate.f.value.w_stb):

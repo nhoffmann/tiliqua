@@ -52,6 +52,25 @@ impl Polysynth0 {
         self.registers.reso().write(|w| unsafe { w.value().bits(value) } );
     }
 
+    /// Envelope -> cutoff amount, bipolar (i16: -32768..32767 = -1.0..1.0).
+    pub fn set_env_amt(&mut self, value: i16)  {
+        self.registers.env_amt().write(|w| unsafe { w.value().bits(value as u16) } );
+    }
+
+    /// Per-voice cutoff base in normalized octaves (i16: 32768 = 1.0 = 10 octaves).
+    pub fn set_cutoff_base(&mut self, voice: usize, value: i16)  {
+        let v = value as u16;
+        match voice {
+            0 => { self.registers.cutoff_base0().write(|w| unsafe { w.value().bits(v) } ); }
+            1 => { self.registers.cutoff_base1().write(|w| unsafe { w.value().bits(v) } ); }
+            2 => { self.registers.cutoff_base2().write(|w| unsafe { w.value().bits(v) } ); }
+            3 => { self.registers.cutoff_base3().write(|w| unsafe { w.value().bits(v) } ); }
+            4 => { self.registers.cutoff_base4().write(|w| unsafe { w.value().bits(v) } ); }
+            5 => { self.registers.cutoff_base5().write(|w| unsafe { w.value().bits(v) } ); }
+            _ => {}
+        }
+    }
+
     pub fn set_attack_rate(&mut self, value: u16)  {
         self.registers.attack_rate().write(|w| unsafe { w.value().bits(value) } );
     }

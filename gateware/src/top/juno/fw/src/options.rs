@@ -8,6 +8,7 @@ pub enum Page {
     #[default]
     Help,
     Voice,
+    Vcf,
     Adsr,
     Effect,
     Misc,
@@ -27,6 +28,14 @@ pub enum Waveform {
     Formant,
     OvSine,
     Strng,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum EnvPolarity {
+    #[default]
+    Pos,
+    Neg,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -88,6 +97,9 @@ impl MidiChannel {
 int_params!(PageNumParams<u16>    { step: 1, min: 0, max: 0 });
 int_params!(ProcAmtParams<u16>   { step: 1, min: 0, max: 50, format: IntFormat::Scaled { divisor: 10, precision: 1, suffix: "" } });
 int_params!(DriveParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(CutoffParams<u16>     { step: 512, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(EnvAmtParams<u16>     { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(KbdTrackParams<u16>   { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(ResoParams<u16>       { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(DiffuseParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(AdsrTimeParams<u16>  { step: 1024, min: 0, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
@@ -112,12 +124,25 @@ pub struct VoiceOpts {
     pub proc: EnumOption<ProcMode>,
     #[option(10)]
     pub proc_amt: IntOption<ProcAmtParams>,
-    #[option(16384)]
-    pub reso: IntOption<ResoParams>,
     #[option(1)]
     pub lfo_rate: IntOption<LfoRateParams>,
     #[option(3277)]
     pub lfo_depth: IntOption<LfoDepthParams>,
+}
+
+// Juno-style VCF: exponential cutoff (0..1 = 10 octaves, 12 Hz .. 12 kHz).
+#[derive(OptionPage, Clone)]
+pub struct VcfOpts {
+    #[option(11469)]
+    pub cutoff: IntOption<CutoffParams>,
+    #[option(16384)]
+    pub reso: IntOption<ResoParams>,
+    #[option(19661)]
+    pub env_amt: IntOption<EnvAmtParams>,
+    #[option]
+    pub env_pol: EnumOption<EnvPolarity>,
+    #[option(16384)]
+    pub kbd_track: IntOption<KbdTrackParams>,
 }
 
 #[derive(OptionPage, Clone)]
@@ -163,6 +188,8 @@ pub struct Opts {
     pub help: HelpOpts,
     #[page(Page::Voice)]
     pub voice: VoiceOpts,
+    #[page(Page::Vcf)]
+    pub vcf: VcfOpts,
     #[page(Page::Adsr)]
     pub adsr: AdsrOpts,
     #[page(Page::Effect)]

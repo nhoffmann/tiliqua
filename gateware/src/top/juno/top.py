@@ -135,6 +135,9 @@ from tiliqua.build.types import BitstreamHelp
 from tiliqua.dsp import ASQ
 from tiliqua.tiliqua_soc import TiliquaSoc
 
+# top.py is run as a script (pdm run juno), so import the sibling module directly.
+from juno_voice import JunoVoice, MultiADSR
+
 class Diffuser(wiring.Component):
 
     i: In(stream.Signature(data.ArrayLayout(ASQ, 4)))
@@ -181,10 +184,10 @@ class PolySynth(wiring.Component):
 
     drive: In(unsigned(16))
     reso: In(unsigned(16))
-    attack_rate: In(dsp.MultiADSR.EnvUQ)
-    decay_rate: In(dsp.MultiADSR.EnvUQ)
-    sustain_level: In(dsp.MultiADSR.EnvUQ)
-    release_rate: In(dsp.MultiADSR.EnvUQ)
+    attack_rate: In(MultiADSR.EnvUQ)
+    decay_rate: In(MultiADSR.EnvUQ)
+    sustain_level: In(MultiADSR.EnvUQ)
+    release_rate: In(MultiADSR.EnvUQ)
 
     # Wavetable write port (firmware fills via CSR)
     wt_write_addr: In(unsigned(9))
@@ -213,7 +216,7 @@ class PolySynth(wiring.Component):
         # Connect MIDI stream -> voice tracker
         wiring.connect(m, wiring.flipped(self.i_midi), voice_tracker.i)
 
-        m.submodules.voice_block = voice_block = dsp.VoiceBlock(n_voices=n_voices)
+        m.submodules.voice_block = voice_block = JunoVoice(n_voices=n_voices)
 
         # latch CV ins
         cv = Signal.like(self.i.payload)
@@ -246,8 +249,8 @@ class PolySynth(wiring.Component):
             # CV 1: filter envelope bipolar offset (when jack 1 patched)
             vel_base = fixed.UQ(0, 8)(voice_tracker.o[n].velocity_mod)
             vel_sum = vel_base + cv[1]
-            vel_out = Signal(dsp.MultiADSR.EnvUQ, name=f"vel_out_{n}")
-            m.d.comb += vel_out.eq(vel_sum.saturate(dsp.MultiADSR.EnvUQ))
+            vel_out = Signal(MultiADSR.EnvUQ, name=f"vel_out_{n}")
+            m.d.comb += vel_out.eq(vel_sum.saturate(MultiADSR.EnvUQ))
             m.d.comb += [
                 self.voice_states[n].eq(voice_tracker.o[n]),
                 self.voice_cutoffs[n].eq(voice_block.voice_cutoffs[n]),

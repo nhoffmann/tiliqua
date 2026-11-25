@@ -370,6 +370,8 @@ class MultiSVF(wiring.Component):
     - Per-voice samples in and cutoff (envelope)
     - Global resonance (all filters)
     - LPF output has a DC-blocking stage so 0 cutoff doesn't emit DC
+    - Per-voice VCA after the DC block: output = filtered * env (Juno port addition,
+      uses the same multiplier, no extra DSP tile)
 
     This is just N copies of the one-in-one-out ``SVF`` and ``DCBlock`` from ``dsp.filters``.
     """
@@ -423,6 +425,10 @@ class MultiSVF(wiring.Component):
         dc_x = Signal(svf_sh)
         dc_y = Signal(svf_sh)
 
+        # VCA: the same per-voice envelope that sets the cutoff scales the output.
+        vca_env = Signal(mac.SQNative)
+        vca_out = Signal(svf_sh)
+
         in_first = Signal(1)
         voice_ix = Signal(range(N))
 
@@ -434,6 +440,7 @@ class MultiSVF(wiring.Component):
                     m.d.sync += [
                         svf_x.eq(self.i.payload.sample.x >> 1),
                         svf_kK.as_value().eq(self.i.payload.sample.env.as_value() >> 3),
+                        vca_env.eq(self.i.payload.sample.env),
                         svf_kQinv.as_value().eq(self.reso),
                         in_first.eq(self.i.payload.first),
                         oversample.eq(0),
@@ -483,7 +490,12 @@ class MultiSVF(wiring.Component):
                     dc_y.eq(svf_out - dc_x + dc_y - (dc_y >> DC_SHIFT)),
                     dc_x.eq(svf_out),
                 ]
-                m.next = 'STORE'
+                m.next = 'VCA'
+
+            with m.State('VCA'):
+                with mp.Multiply(m, a=dc_y, b=vca_env):
+                    m.d.sync += vca_out.eq(mp.result.z)
+                    m.next = 'STORE'
 
             with m.State('STORE'):
                 m.d.comb += [
@@ -501,7 +513,7 @@ class MultiSVF(wiring.Component):
                 m.d.comb += [
                     self.o.valid.eq(1),
                     self.o.payload.first.eq(in_first),
-                    self.o.payload.sample.eq(dc_y),
+                    self.o.payload.sample.eq(vca_out),
                 ]
                 with m.If(self.o.ready):
                     with m.If(voice_ix == N - 1):

@@ -52,6 +52,27 @@ class JunoVoiceTests(unittest.TestCase):
         f = estimate_freq(out[len(out) // 4:, 0])
         self.assertAlmostEqual(f, 880.0, delta=8.8)
 
+    # Envelope rates are per-sample increments of a 16-bit level: 2048 ≈ 16 samples
+    # for a full-scale ramp. Fast settings keep these renders short.
+
+    def test_vca_release_goes_silent(self):
+        """After note-off with a fast release, the VCA brings the output to ~0."""
+        p = Params(attack=8192, decay=8192, sustain=65535, release=2048)
+        out = render([Note(0, 60, 0.0, 0.015)], seconds=0.025, params=p)
+        held = rms(out[int(0.008 * FS):int(0.015 * FS), 0])
+        tail = rms(out[int(0.020 * FS):, 0])
+        self.assertGreater(held, 0.01)
+        self.assertLess(tail, 0.01 * held)
+
+    def test_vca_zero_sustain_decays_while_held(self):
+        """Sustain 0: the note dies away although the gate is still held (pluck)."""
+        p = Params(attack=8192, decay=2048, sustain=0, release=2048)
+        out = render([Note(0, 60, 0.0, 1.0)], seconds=0.015, params=p)
+        early = rms(out[:int(0.002 * FS), 0])
+        late = rms(out[int(0.010 * FS):, 0])
+        self.assertGreater(early, 0.005)
+        self.assertLess(late, 0.01 * early)
+
 
 if __name__ == "__main__":
     unittest.main()

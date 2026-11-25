@@ -149,7 +149,8 @@ from tiliqua.dsp import ASQ
 from tiliqua.tiliqua_soc import TiliquaSoc
 
 # top.py is run as a script (pdm run juno), so import the sibling module directly.
-from juno_voice import JunoVoice, MultiADSR
+from juno_voice import JunoVoice, MultiADSR, PitchToInc
+from juno_tracker import JunoVoiceState, JunoVoiceTracker
 
 class Diffuser(wiring.Component):
 
@@ -216,7 +217,7 @@ class PolySynth(wiring.Component):
     # Per-voice cutoff base (firmware: knob + keyboard tracking + mod wheel)
     voice_cutoff_base: In(ASQ).array(N_VOICES)
 
-    voice_states: Out(midi.MidiVoice).array(N_VOICES)
+    voice_states: Out(JunoVoiceState).array(N_VOICES)
     voice_cutoffs: Out(unsigned(8)).array(N_VOICES)
 
     def __init__(self):
@@ -227,8 +228,12 @@ class PolySynth(wiring.Component):
 
         n_voices = self.N_VOICES
 
-        m.submodules.voice_tracker = voice_tracker = midi.MidiVoiceTracker(
-            max_voices=n_voices, velocity_mod=False, zero_velocity_gate=False)
+        m.submodules.voice_tracker = voice_tracker = JunoVoiceTracker(
+            max_voices=n_voices, zero_velocity_gate=False)
+
+        # Pitch bend range: +-2 semitones (exact, log domain).
+        # PitchSQ raw = semitones * 1024; ASQ raw bend = +-32768 -> +-2048 = +-2 semitones.
+        BEND_SHIFT = 4
 
         # Connect MIDI stream -> voice tracker
         wiring.connect(m, wiring.flipped(self.i_midi), voice_tracker.i)
@@ -263,15 +268,19 @@ class PolySynth(wiring.Component):
 
         # per-voice params
         for n in range(n_voices):
-            # Note velocity scales the envelope (VCF + VCA). The mod wheel no longer
-            # caps it (velocity_mod=False), otherwise CC1=0 would mute the VCA.
+            # Note-on velocity scales the envelope (VCF + VCA).
             vel_out = Signal(MultiADSR.EnvUQ, name=f"vel_out_{n}")
-            m.d.comb += vel_out.eq(fixed.UQ(0, 8)(voice_tracker.o[n].velocity_mod))
+            m.d.comb += vel_out.eq(fixed.UQ(0, 8)(voice_tracker.o[n].velocity_on))
+            # Log-domain pitch: note + pitch bend (later: LFO vibrato, CV, detune)
+            pitch = Signal(PitchToInc.PitchSQ, name=f"pitch_{n}")
+            m.d.comb += pitch.as_value().eq(
+                (voice_tracker.o[n].note << PitchToInc.FINE_BITS)
+                + (voice_tracker.pitch_bend.as_value() >> BEND_SHIFT))
             m.d.comb += [
                 self.voice_states[n].eq(voice_tracker.o[n]),
                 self.voice_cutoffs[n].eq(voice_block.voice_cutoffs[n]),
                 voice_block.voice_gates[n].eq(voice_tracker.o[n].gate),
-                voice_block.voice_freq_incs[n].eq(voice_tracker.o[n].freq_inc),
+                voice_block.voice_pitch[n].eq(pitch),
                 voice_block.voice_velocity[n].eq(vel_out),
                 voice_block.voice_cutoff_base[n].eq(self.voice_cutoff_base[n]),
                 voice_tracker.voice_active[n].eq(voice_block.voice_active[n]),

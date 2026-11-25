@@ -7,7 +7,7 @@ so changes can be listened to (WAV) and checked numerically without hardware.
 
 Sample rate is nominal 48 kHz: the hardware pulls one stereo sample per audio
 frame, here the testbench pulls them as fast as the simulated block produces
-them. Pitch is mapped exactly like ``MidiVoiceTracker`` (freq_inc = f / 48000).
+them. Pitch is sent in semitones (note + bend), like the juno top level.
 
 Usage (writes WAVs to ``build/juno_sim/``)::
 
@@ -27,16 +27,12 @@ from amaranth_future import fixed
 from tiliqua.dsp import ASQ
 from tiliqua.test import stream
 
-from top.juno.juno_voice import JunoVoice, MultiADSR, MultiSVF
+from top.juno.juno_voice import JunoVoice, MultiADSR, MultiSVF, PitchToInc
 
 FS = 48000
 N_VOICES = 6
 WT_SIZE = JunoVoice.WAVETABLE_SIZE
 EnvUQ = MultiADSR.EnvUQ
-
-
-def note_to_freq_inc(note):
-    return 440.0 * 2 ** ((note - 69) / 12.0) / FS
 
 
 def adsr_ui_to_rate(ui_value):
@@ -105,6 +101,7 @@ class Params:
     env_amt: float = 0.6
     kbd:     float = 0.5
     mod_wheel: float = 0.0
+    bend_semitones: float = 0.0    # pitch bend applied to all notes (top.py: +-2 range)
     cutoff_cv_volts: float = 0.0   # CV in1, 1 V/oct
     wavetable: list = field(default_factory=juno_table)  # firmware default: juno, saw only
 
@@ -147,8 +144,9 @@ def render(notes, seconds, params=None, n_voices=N_VOICES):
             while ev < len(events) and events[ev][0] <= i:
                 _, note, gate = events[ev]
                 if gate:
-                    ctx.set(dut.voice_freq_incs[note.voice],
-                            fixed.Const(note_to_freq_inc(note.note), shape=ASQ))
+                    ctx.set(dut.voice_pitch[note.voice],
+                            fixed.Const(note.note + params.bend_semitones,
+                                        shape=PitchToInc.PitchSQ))
                     ctx.set(dut.voice_velocity[note.voice],
                             fixed.Const(note.velocity, shape=EnvUQ))
                     base = cutoff_base(params.cutoff, params.kbd, note.note, params.mod_wheel)

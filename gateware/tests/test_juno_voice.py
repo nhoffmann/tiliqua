@@ -10,9 +10,15 @@ a few thousand samples. Longer renders for listening:
 
 import unittest
 
-import numpy as np
+import random
 
-from top.juno.juno_voice import MultiSVF
+import numpy as np
+from amaranth import Module
+from amaranth.sim import Simulator
+
+from amaranth_future import fixed
+
+from top.juno.juno_voice import MultiSVF, PitchToInc
 from top.juno.sim_render import FS, Note, Params, juno_table, render
 
 
@@ -68,6 +74,55 @@ class JunoVoiceTests(unittest.TestCase):
         # skip the attack / filter settling at the start
         f = estimate_freq(out[len(out) // 4:, 0])
         self.assertAlmostEqual(f, 880.0, delta=8.8)
+
+    def test_pitch_to_inc_matches_model(self):
+        """PitchToInc gateware is bit-exact with its Python model (incl. clamping),
+        and the model is within 0.01 cents of the ideal increment."""
+        rng = random.Random(1)
+        pitches = [0, 1023, 69 * 1024, 127 * 1024 + 1023, -5000, 140 * 1024]
+        pitches += [rng.randrange(-2048, 130 * 1024) for _ in range(40)]
+        m = Module()
+        m.submodules.dut = dut = PitchToInc()
+        results = []
+
+        async def testbench(ctx):
+            for raw in pitches:
+                ctx.set(dut.pitch.as_value(), raw)
+                for _ in range(PitchToInc.LATENCY):
+                    await ctx.tick()
+                results.append(ctx.get(dut.inc))
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+        for raw, got in zip(pitches, results):
+            self.assertEqual(got, PitchToInc.model(raw), f"pitch raw {raw}")
+            if 0 <= raw < 128 * 1024:
+                cents = 1200 * np.log2(got / PitchToInc.exact_inc(raw / 1024))
+                self.assertLess(abs(cents), 0.01, f"pitch raw {raw}")
+
+    def test_pitch_bend(self):
+        """Pitch bend is exact in the log domain: +2 semitones on A4 -> B4."""
+        p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
+                   cutoff=0.85, env_amt=0.0, kbd=0.0, bend_semitones=2.0)
+        out = render([Note(0, 69, 0.0, 1.0)], seconds=0.03, params=p)
+        f = estimate_freq(out[len(out) // 4:, 0])
+        expected = 440.0 * 2 ** (2 / 12)
+        self.assertLess(abs(1200 * np.log2(f / expected)), 2.0)
+
+    def test_pitch_full_range(self):
+        """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the
+        16-bit freq_inc of the upstream tracker is -25 cents at C1, +13.5 at C2)."""
+        p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
+                   cutoff=0.85, env_amt=0.0, kbd=0.0)
+        for note, seconds in [(24, 0.16), (36, 0.09), (48, 0.05), (84, 0.03), (96, 0.03)]:
+            with self.subTest(note=note):
+                expected = 440.0 * 2 ** ((note - 69) / 12)
+                out = render([Note(0, note, 0.0, 1.0)], seconds=seconds, params=p)
+                f = estimate_freq(out[len(out) // 4:, 0])
+                cents = 1200 * np.log2(f / expected)
+                self.assertLess(abs(cents), 2.0, f"{f:.3f} Hz vs {expected:.3f} Hz")
 
     # Envelope rates are per-sample increments of a 16-bit level: 2048 ≈ 16 samples
     # for a full-scale ramp. Fast settings keep these renders short.

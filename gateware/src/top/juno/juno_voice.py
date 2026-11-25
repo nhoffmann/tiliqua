@@ -47,26 +47,179 @@ from tiliqua.dsp import ASQ, mac
 from tiliqua.dsp.block import Block, BlockMerge
 
 
+class PipelinedMAC(mac.MAC):
+
+    """
+    Juno port: a dedicated multiplier with registered operands and result.
+
+    ``mac.MuxMAC`` (the library default) is purely combinational, so a block with
+    many multiply steps ends up with a long path: FSM-driven operand mux ->
+    multiplier -> accumulate -> register. This version registers the operands and
+    the product, so ``valid`` comes 2 cycles after the operands are presented.
+    ``MAC.Multiply`` already supports latency (operands are held until ``valid``).
+
+    Back-to-back ``Multiply`` calls in consecutive FSM states keep ``strobe`` high;
+    the stage counter wraps on ``valid`` so the next operation starts fresh.
+    """
+
+    LATENCY = 2
+
+    def elaborate(self, platform):
+        m = Module()
+        a = Signal.like(self.operands.a)
+        b = Signal.like(self.operands.b)
+        stage = Signal(range(self.LATENCY + 1))
+        m.d.sync += [
+            a.eq(self.operands.a),
+            b.eq(self.operands.b),
+            self.result.z.eq(a * b),
+        ]
+        with m.If(self.strobe):
+            with m.If(stage == self.LATENCY):
+                m.d.sync += stage.eq(0)
+            with m.Else():
+                m.d.sync += stage.eq(stage + 1)
+        with m.Else():
+            m.d.sync += stage.eq(0)
+        m.d.comb += self.valid.eq(self.strobe & (stage == self.LATENCY))
+        return m
+
+
+class PitchToInc(wiring.Component):
+
+    """
+    Log-domain pitch -> 32-bit phase increment (Juno port).
+
+    ``pitch`` is in semitones on the MIDI note scale (69.0 = A4 = 440 Hz), with
+    1/1024-semitone resolution. ``inc`` is the per-sample phase increment as a
+    fraction of a cycle in UQ(0, 32), i.e. f / FS * 2**32.
+
+    Two lookup tables:
+
+    - note table (128 entries): increment of each integer note, normalized to a
+      32-bit mantissa in [2**31, 2**32) plus a right-shift, so even the lowest notes
+      keep full precision;
+    - fine table (1024 entries): 2**(k / 1024 / 12) - 1 for the fractional semitone.
+
+    ``inc = (mant + mant * fine) >> shift``, with one 17x17 multiply.
+    Pitch is clamped to notes 0..127 (+ fraction).
+
+    Fixed latency: hold ``pitch`` stable; ``inc`` is valid ``LATENCY`` cycles later.
+    """
+
+    PitchSQ = fixed.SQ(9, 10)
+    FINE_BITS = 10
+    LATENCY = 3
+    FS = 48000
+    N_NOTES = 128
+    # fine table scale: value * 2**FINE_SCALE (max 0.0595 * 2**21 < 2**17)
+    FINE_SCALE = 21
+    MANT_SHIFT = 15   # mantissa bits dropped before the 17x17 multiply
+
+    @classmethod
+    def exact_inc(cls, pitch):
+        """Ideal (float) increment for a pitch in semitones."""
+        return 440.0 * 2 ** ((pitch - 69) / 12) / cls.FS * 2 ** 32
+
+    @classmethod
+    def note_table(cls):
+        table = []
+        for n in range(cls.N_NOTES):
+            inc = cls.exact_inc(n)
+            shift = 0
+            while inc * 2 ** (shift + 1) < 2 ** 32:
+                shift += 1
+            mant = min(round(inc * 2 ** shift), 2 ** 32 - 1)
+            table.append((mant, shift))
+        return table
+
+    @classmethod
+    def fine_table(cls):
+        n = 1 << cls.FINE_BITS
+        return [round((2 ** (k / n / 12) - 1) * 2 ** cls.FINE_SCALE) for k in range(n)]
+
+    @classmethod
+    def model(cls, pitch_raw):
+        """Bit-exact Python model. ``pitch_raw`` = pitch * 1024 (integer)."""
+        semi, frac = pitch_raw >> cls.FINE_BITS, pitch_raw & ((1 << cls.FINE_BITS) - 1)
+        if semi < 0:
+            semi, frac = 0, 0
+        elif semi >= cls.N_NOTES:
+            semi, frac = cls.N_NOTES - 1, (1 << cls.FINE_BITS) - 1
+        mant, shift = cls.note_table()[semi]
+        prod = (mant >> cls.MANT_SHIFT) * cls.fine_table()[frac]
+        full = mant + (prod >> (cls.FINE_SCALE - cls.MANT_SHIFT))
+        return (full >> shift) & 0xFFFFFFFF
+
+    def __init__(self):
+        super().__init__({
+            "pitch": In(self.PitchSQ),
+            "inc":   Out(unsigned(32)),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+
+        notes = self.note_table()
+        shift_bits = max(s for _, s in notes).bit_length()
+        note_layout = data.StructLayout({"mant": unsigned(32), "shift": unsigned(shift_bits)})
+        m.submodules.note_mem = note_mem = Memory(
+            shape=note_layout, depth=self.N_NOTES,
+            init=[{"mant": mt, "shift": sh} for mt, sh in notes])
+        m.submodules.fine_mem = fine_mem = Memory(
+            shape=unsigned(17), depth=1 << self.FINE_BITS, init=self.fine_table())
+        note_rd = note_mem.read_port()
+        fine_rd = fine_mem.read_port()
+        m.d.comb += [note_rd.en.eq(1), fine_rd.en.eq(1)]
+
+        # Cycle 0: clamp and address the tables
+        raw = self.pitch.as_value()
+        semi = raw >> self.FINE_BITS
+        frac = raw[:self.FINE_BITS]
+        with m.If(semi < 0):
+            m.d.comb += [note_rd.addr.eq(0), fine_rd.addr.eq(0)]
+        with m.Elif(semi >= self.N_NOTES):
+            m.d.comb += [note_rd.addr.eq(self.N_NOTES - 1),
+                         fine_rd.addr.eq((1 << self.FINE_BITS) - 1)]
+        with m.Else():
+            m.d.comb += [note_rd.addr.eq(semi), fine_rd.addr.eq(frac)]
+
+        # Cycle 1: 17x17 multiply on the mantissa top bits
+        prod = Signal(34)
+        mant = Signal(32)
+        shift = Signal(shift_bits)
+        m.d.sync += [
+            prod.eq((note_rd.data.mant >> self.MANT_SHIFT) * fine_rd.data),
+            mant.eq(note_rd.data.mant),
+            shift.eq(note_rd.data.shift),
+        ]
+
+        # Cycle 2: add and shift down by the octave
+        full = Signal(33)
+        m.d.comb += full.eq(mant + (prod >> (self.FINE_SCALE - self.MANT_SHIFT)))
+        m.d.sync += self.inc.eq(full >> shift)
+
+        return m
+
+
 class MultiWavetableOsc(wiring.Component):
 
     """
     N wavetable oscillators with:
-    - Per-voice pitch input
+    - Per-voice log-domain pitch input (``PitchToInc``), 32-bit phase accumulator
     - Global phase modulation (up to audio rate)
     - Linear interpolation between wavetable samples
 
     Free-running: sample rate is determined by backpressure on ``self.o``.
     """
 
-
-    def __init__(self, n, wt_size=512, sq=ASQ, phase_f_bits=8):
+    def __init__(self, n, wt_size=512, sq=ASQ):
         self.n = n
         self.wt_size = wt_size
         self.sq = sq
-        self.phase_sq = fixed.UQ(exact_log2(wt_size) + 1, phase_f_bits)
         super().__init__({
-            # Pitch input (per-voice)
-            "voice_freq_incs": In(data.ArrayLayout(sq, n)),
+            # Pitch input (per-voice), semitones (see PitchToInc)
+            "voice_pitch":     In(data.ArrayLayout(PitchToInc.PitchSQ, n)),
             # Phase modulation (all voices) for CV FM up to audio rate
             "phase_mod":       In(sq),
             # Wavetable memory access (to expose to SoC)
@@ -81,6 +234,8 @@ class MultiWavetableOsc(wiring.Component):
         m = Module()
         N = self.n
         WT_SIZE = self.wt_size
+        WT_BITS = exact_log2(WT_SIZE)
+        FRAC_BITS = 8
 
         # Wavetable memory
 
@@ -96,27 +251,34 @@ class MultiWavetableOsc(wiring.Component):
             wt_wport.en.eq(self.wt_write_en),
         ]
 
-        # Per-voice phase memory
+        # Per-voice phase memory: UQ(0, 32) fraction of a cycle
 
         m.submodules.state_mem = state_mem = Memory(
-            shape=self.phase_sq, depth=N, init=[])
+            shape=unsigned(32), depth=N, init=[])
         st_rport = state_mem.read_port()
         st_wport = state_mem.write_port()
         m.d.comb += st_rport.en.eq(1)
 
+        m.submodules.pitch2inc = p2i = PitchToInc()
+
         # Registers across all voices
 
-        cur_phase = Signal(self.phase_sq)
-        cur_freq_inc = Signal(self.sq)
+        cur_phase = Signal(32)
+        cur_pitch = Signal(PitchToInc.PitchSQ)
         wt_sample = Signal(self.sq)
         read0 = Signal(self.sq)
         read1 = Signal(self.sq)
         voice_ix = Signal(range(N))
+        pitch_wait = Signal(range(PitchToInc.LATENCY + 1))
 
-        # Phase-modulated 'final phase' for wavetable lookup.
-        phase_mod = Signal(self.sq)
-        m.d.comb += phase_mod.eq(self.phase_mod)
-        mod_pos = cur_phase + (phase_mod << self.phase_sq.f_bits)
+        m.d.comb += p2i.pitch.eq(cur_pitch)
+
+        # Phase-modulated 'final phase' for wavetable lookup: phase_mod +-1.0 = +-0.5 cycle
+        mod_pos = Signal(32)
+        m.d.comb += mod_pos.eq(cur_phase + (self.phase_mod.as_value() << 16))
+        wt_index = mod_pos[32 - WT_BITS:]
+        frac = Signal(fixed.UQ(0, FRAC_BITS))
+        m.d.comb += frac.as_value().eq(mod_pos[32 - WT_BITS - FRAC_BITS:32 - WT_BITS])
 
         with m.FSM():
 
@@ -125,32 +287,33 @@ class MultiWavetableOsc(wiring.Component):
                 m.next = 'LATCH-STATE'
 
             with m.State('LATCH-STATE'):
-                m.d.sync += cur_phase.eq(st_rport.data)
+                m.d.sync += [
+                    cur_phase.eq(st_rport.data),
+                    pitch_wait.eq(0),
+                ]
                 with m.Switch(voice_ix):
                     for n in range(N):
                         with m.Case(n):
-                            # Latch freq_inc for current voice
-                            m.d.sync += cur_freq_inc.eq(self.voice_freq_incs[n])
-                m.next = 'PHASE-ADVANCE'
+                            m.d.sync += cur_pitch.eq(self.voice_pitch[n])
+                m.next = 'PITCH-WAIT'
+
+            with m.State('PITCH-WAIT'):
+                # PitchToInc has a fixed latency; cur_pitch is held stable meanwhile
+                m.d.sync += pitch_wait.eq(pitch_wait + 1)
+                with m.If(pitch_wait == PitchToInc.LATENCY - 1):
+                    m.next = 'PHASE-ADVANCE'
 
             with m.State('PHASE-ADVANCE'):
-                new_pos = Signal(self.phase_sq)
-                m.d.comb += new_pos.eq(
-                    cur_phase + (cur_freq_inc << exact_log2(WT_SIZE)))
-                with m.If(new_pos.truncate() >= WT_SIZE):
-                    wt_size_phase = fixed.Const(WT_SIZE, self.phase_sq)
-                    m.d.sync += cur_phase.eq(new_pos - wt_size_phase)
-                with m.Else():
-                    m.d.sync += cur_phase.eq(new_pos)
+                m.d.sync += cur_phase.eq(cur_phase + p2i.inc)  # wraps at 2**32
                 m.next = 'WT-ADDR0'
 
             with m.State('WT-ADDR0'):
-                m.d.comb += wt_rport.addr.eq(mod_pos.truncate() + 1)
+                m.d.comb += wt_rport.addr.eq(wt_index + 1)
                 m.next = 'WT-READ0'
 
             with m.State('WT-READ0'):
                 m.d.sync += read0.eq(wt_rport.data)
-                m.d.comb += wt_rport.addr.eq(mod_pos.truncate())
+                m.d.comb += wt_rport.addr.eq(wt_index)
                 m.next = 'WT-READ1'
 
             with m.State('WT-READ1'):
@@ -158,8 +321,6 @@ class MultiWavetableOsc(wiring.Component):
                 m.next = 'INTERP'
 
             with m.State('INTERP'):
-                frac = Signal(fixed.UQ(1, mod_pos.shape().f_bits))
-                m.d.comb += frac.eq(mod_pos - mod_pos.truncate())
                 m.d.sync += wt_sample.eq(read1 + (read0 - read1) * frac)
                 m.next = 'STORE'
 
@@ -684,7 +845,8 @@ class JunoVoice(wiring.Component):
 
             # Voice control (from MidiVoiceTracker)
             "voice_gates":     In(data.ArrayLayout(unsigned(1), self.n_voices)),
-            "voice_freq_incs": In(data.ArrayLayout(sq, self.n_voices)),
+            # Per-voice pitch in semitones (MIDI note scale, see PitchToInc)
+            "voice_pitch":     In(data.ArrayLayout(PitchToInc.PitchSQ, self.n_voices)),
             "voice_velocity":  In(data.ArrayLayout(MultiADSR.EnvUQ, self.n_voices)),
 
             # Global synth parameters (from CSR)
@@ -723,13 +885,14 @@ class JunoVoice(wiring.Component):
         m.submodules.osc = osc = MultiWavetableOsc(n=N, wt_size=self.WAVETABLE_SIZE, sq=sq)
         m.submodules.adsr = adsr = MultiADSR(n=N)
         m.submodules.merge = merge = BlockMerge({"x": sq, "env": MultiADSR.EnvUQ})
-        m.submodules.svf = svf = MultiSVF(n=N, sq=sq)
+        # Pipelined multiplier: keeps the 60 MHz domain clear of the SVF MAC path
+        m.submodules.svf = svf = MultiSVF(n=N, sq=sq, macp=PipelinedMAC())
         m.submodules.mixer = mixer = VoiceMixer(n=N, sq=sq)
 
         # Wire external ports -> internal components
         for n in range(N):
             m.d.comb += [
-                osc.voice_freq_incs[n].eq(self.voice_freq_incs[n]),
+                osc.voice_pitch[n].eq(self.voice_pitch[n]),
                 adsr.voice_gates[n].eq(self.voice_gates[n]),
                 adsr.voice_velocity[n].eq(self.voice_velocity[n]),
                 self.voice_active[n].eq(adsr.voice_active[n]),

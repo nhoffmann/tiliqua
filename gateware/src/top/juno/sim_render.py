@@ -11,7 +11,10 @@ them. Pitch is sent in semitones (note + bend), like the juno top level.
 
 Usage (writes WAVs to ``build/juno_sim/``)::
 
-    pdm run python -m top.juno.sim_render [--seconds 0.5] [scene ...]
+    pdm run python -m top.juno.sim_render [--seconds 0.5] [--engine vl|amaranth] [scene ...]
+
+``--engine vl`` (default) renders with Verilator (``vl_render.py``, seconds per
+clip, bit-identical); ``amaranth`` uses amaranth.sim (~15 min per second).
 """
 
 import argparse
@@ -92,59 +95,80 @@ class Params:
     vca_gate:     bool = False  # VCA Gate mode instead of envelope
 
 
-def render(notes, seconds, params=None, n_voices=N_VOICES):
-    """Render ``seconds`` of audio. Returns float array of shape (n_samples, 2)."""
+def _raw(value, shape):
+    return fixed.Const(value, shape=shape)._value
+
+
+def prepare(notes, seconds, params=None):
+    """Notes + params -> raw register values and a sorted event list, shared by
+    the Python simulation (``render``) and the Verilator harness (``vl_render``).
+
+    Returns ``(n_samples, settings, events)``: ``settings`` maps ``JunoCore`` port
+    names to raw integers; ``events`` are ``(sample, voice, gate, pitch_raw,
+    velocity_raw, cutoff_base_raw)``, gate-off before gate-on at the same sample.
+    Pitch / velocity / cutoff are only applied on gate-on.
+    """
     params = params or Params()
     n_samples = int(seconds * FS)
+    settings = {
+        "saw_en":         int(params.saw),
+        "pulse_en":       int(params.pulse),
+        "pw_knob":        round(params.pw * 32768),
+        "pwm_lfo":        int(params.pwm_lfo),
+        "vca_gate_mode":  int(params.vca_gate),
+        "lfo_rate_inc":   round(params.lfo_rate_hz / FS * 2 ** 32),
+        "lfo_delay_step": (1 << 30) if params.lfo_delay_s <= 0
+                          else max(1, round((1 << 30) / (params.lfo_delay_s * FS))),
+        "lfo_dco_depth":  round(params.dco_lfo_semi * 1024),
+        "lfo_vcf_depth":  round(params.vcf_lfo * 32768),
+        "sub_gain":       round(0.67 * params.sub * 65535),
+        "noise_gain":     round(params.noise * 65535),
+        "attack_rate":    params.attack,
+        "decay_rate":     params.decay,
+        "sustain_level":  params.sustain,
+        "release_rate":   params.release,
+        "reso":           params.reso,
+        "env_amt":        _raw(params.env_amt, ASQ),
+        "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
+    }
+    events = []
+    for n in notes:
+        base = cutoff_base(params.cutoff, params.kbd, n.note, params.mod_wheel)
+        on = (int(n.on_s * FS), n.voice, 1,
+              _raw(n.note + params.bend_semitones, PitchToInc.PitchSQ),
+              _raw(n.velocity, EnvUQ),
+              _raw(max(-1.0, min(base, 0.99997)), ASQ))
+        events.append(on)
+        events.append((int(n.off_s * FS), n.voice, 0, 0, 0, 0))
+    events.sort(key=lambda e: (e[0], e[2]))
+    return n_samples, settings, events
+
+
+def render(notes, seconds, params=None, n_voices=N_VOICES):
+    """Render ``seconds`` of audio with amaranth.sim (slow, ~15 min per second
+    of audio). Returns float array of shape (n_samples, 2). ``vl_render.render_vl``
+    is the fast, bit-identical alternative."""
+    n_samples, settings, events = prepare(notes, seconds, params)
     out = np.zeros((n_samples, 2))
 
     m = Module()
     m.submodules.dut = dut = JunoCore(n_voices=n_voices)
 
-    # Gate schedule: per sample index, the state of every voice.
-    events = []
-    for n in notes:
-        events.append((int(n.on_s * FS), n, 1))
-        events.append((int(n.off_s * FS), n, 0))
-    events.sort(key=lambda e: (e[0], e[2]))
-
     async def testbench(ctx):
-        ctx.set(dut.saw_en, int(params.saw))
-        ctx.set(dut.pulse_en, int(params.pulse))
-        ctx.set(dut.pw_knob, round(params.pw * 32768))
-        ctx.set(dut.pwm_lfo, int(params.pwm_lfo))
-        ctx.set(dut.vca_gate_mode, int(params.vca_gate))
-        ctx.set(dut.lfo_rate_inc, round(params.lfo_rate_hz / FS * 2 ** 32))
-        ctx.set(dut.lfo_delay_step, (1 << 30) if params.lfo_delay_s <= 0
-                else max(1, round((1 << 30) / (params.lfo_delay_s * FS))))
-        ctx.set(dut.lfo_dco_depth, round(params.dco_lfo_semi * 1024))
-        ctx.set(dut.lfo_vcf_depth, round(params.vcf_lfo * 32768))
-        ctx.set(dut.sub_gain, round(0.67 * params.sub * 65535))
-        ctx.set(dut.noise_gain, round(params.noise * 65535))
-
-        ctx.set(dut.attack_rate.as_value(), params.attack)
-        ctx.set(dut.decay_rate.as_value(), params.decay)
-        ctx.set(dut.sustain_level.as_value(), params.sustain)
-        ctx.set(dut.release_rate.as_value(), params.release)
-        ctx.set(dut.reso, params.reso)
-        ctx.set(dut.env_amt, fixed.Const(params.env_amt, shape=ASQ))
-        ctx.set(dut.cutoff_cv, fixed.Const(params.cutoff_cv_volts / 8.192, shape=ASQ))
+        for name, raw in settings.items():
+            port = getattr(dut, name)
+            ctx.set(port.as_value() if hasattr(port, "as_value") else port, raw)
         await ctx.tick()
 
         ev = 0
         for i in range(n_samples):
             while ev < len(events) and events[ev][0] <= i:
-                _, note, gate = events[ev]
+                _, voice, gate, pitch, vel, cut = events[ev]
                 if gate:
-                    ctx.set(dut.voice_pitch_base[note.voice],
-                            fixed.Const(note.note + params.bend_semitones,
-                                        shape=PitchToInc.PitchSQ))
-                    ctx.set(dut.voice_velocity[note.voice],
-                            fixed.Const(note.velocity, shape=EnvUQ))
-                    base = cutoff_base(params.cutoff, params.kbd, note.note, params.mod_wheel)
-                    ctx.set(dut.voice_cutoff_base[note.voice],
-                            fixed.Const(max(-1.0, min(base, 0.99997)), shape=ASQ))
-                ctx.set(dut.voice_gates[note.voice], gate)
+                    ctx.set(dut.voice_pitch_base[voice].as_value(), pitch)
+                    ctx.set(dut.voice_velocity[voice].as_value(), vel)
+                    ctx.set(dut.voice_cutoff_base[voice].as_value(), cut)
+                ctx.set(dut.voice_gates[voice], gate)
                 ev += 1
             sample = await stream.get(ctx, dut.o)
             out[i, 0] = sample[0].as_float()
@@ -227,12 +251,18 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--seconds", type=float, default=0.5)
     parser.add_argument("--out", default="build/juno_sim")
+    parser.add_argument("--engine", choices=["vl", "amaranth"], default="vl")
     parser.add_argument("scenes", nargs="*", default=list(SCENES))
     args = parser.parse_args()
+    if args.engine == "vl":
+        from top.juno.vl_render import build, render_vl as engine
+        build(verbose=True)
+    else:
+        engine = render
     for name in args.scenes:
         t0 = time.time()
         notes, params = SCENES[name]
-        audio = render(notes(args.seconds), args.seconds, params)
+        audio = engine(notes(args.seconds), args.seconds, params)
         path = os.path.join(args.out, f"{name}.wav")
         write_wav(path, audio)
         print(f"{path}: {len(audio)} samples, peak {np.abs(audio).max():.3f}, "

@@ -184,6 +184,21 @@ class JunoVoiceTests(unittest.TestCase):
         self.assertEqual(lfo[110], 0)                 # delay restarted by the new note (frame 110)
         self.assertNotEqual(lfo[109], 0)
 
+    @unittest.skipUnless(__import__("shutil").which("verilator"), "verilator not installed")
+    def test_verilator_engine_matches_amaranth(self):
+        """vl_render (Verilator) is bit-identical with the amaranth.sim render:
+        staggered notes + note-offs, PWM by LFO, vibrato, filter LFO, Gate mode,
+        sub and noise."""
+        from top.juno.vl_render import render_vl
+        notes = [Note(0, 48, 0.0, 0.015), Note(1, 55, 0.003, 0.025), Note(2, 64, 0.008, 0.02)]
+        p = Params(attack=8192, decay=4096, sustain=30000, release=4096, pulse=True,
+                   pw=0.6, pwm_lfo=True, dco_lfo_semi=1.0, vcf_lfo=0.2,
+                   lfo_rate_hz=200.0, vca_gate=True, sub=0.5, noise=0.2)
+        a = render(notes, 0.025, p)
+        b = render_vl(notes, 0.025, p)
+        self.assertEqual(np.abs(a - b).max(), 0.0)
+        self.assertGreater(np.abs(a).max(), 0.05)
+
     def test_pitch_bend(self):
         """Pitch bend is exact in the log domain: +2 semitones on A4 -> B4."""
         p = Params(attack=8192, decay=8192, sustain=65535, release=2048,

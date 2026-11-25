@@ -32,7 +32,7 @@ from tiliqua.test import stream
 
 from top.juno.juno_core import JunoCore
 from top.juno.juno_lfo import pw_knob_to_point
-from top.juno.juno_voice import MultiADSR, MultiSVF, PitchToInc
+from top.juno.juno_voice import MultiADSR, MultiLadder, PitchToInc
 
 FS = 48000
 N_VOICES = 6
@@ -48,7 +48,7 @@ def adsr_ui_to_rate(ui_value):
 def cutoff_base(cutoff, kbd, note, mod_wheel=0.0):
     """Per-voice cutoff base, same formula as the firmware (normalized octaves):
     knob + keyboard tracking relative to C4 (note 60) + mod wheel offset."""
-    octave = 1.0 / MultiSVF.CUTOFF_OCTAVES
+    octave = 1.0 / MultiLadder.CUTOFF_OCTAVES
     return cutoff + kbd * (note - 60) / 12 * octave + mod_wheel * MOD_WHEEL_RANGE
 
 
@@ -72,8 +72,8 @@ class Params:
     decay:   int = adsr_ui_to_rate(4096)
     sustain: int = 16384 * 65535 // 32768
     release: int = adsr_ui_to_rate(4096)
-    reso:    int = 32768 - 16384 * 24576 // 32768
-    # Exponential cutoff (normalized octaves, see MultiSVF); firmware defaults
+    res:     float = 0.5      # ladder resonance knob 0..1 (k = 4.5 res; firmware default 0.5)
+    # Exponential cutoff (normalized octaves, see MultiLadder); firmware defaults
     cutoff:  float = 0.35
     env_amt: float = 0.6
     kbd:     float = 0.5
@@ -127,7 +127,7 @@ def prepare(notes, seconds, params=None):
         "decay_rate":     params.decay,
         "sustain_level":  params.sustain,
         "release_rate":   params.release,
-        "reso":           params.reso,
+        "reso":           round(min(params.res, 1.0) * 32768),
         "env_amt":        _raw(params.env_amt, ASQ),
         "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
     }
@@ -232,12 +232,18 @@ SCENES = {
                     Params(cutoff=0.65, env_amt=0.1, saw=False, pulse=True, pw=0.8,
                            pwm_lfo=True, lfo_rate_hz=1.5)),
     "lfo_vcf":     (lambda s: [Note(0, 43, 0.0, s * 0.9)],
-                    Params(cutoff=0.4, env_amt=0.0, reso=12000, vcf_lfo=0.25,
+                    Params(cutoff=0.4, env_amt=0.0, res=0.85, vcf_lfo=0.25,
                            lfo_rate_hz=3.0)),
     "vca_gate":    (lambda s: [Note(v, 48 + 3 * v, v * s / 6, v * s / 6 + s / 10)
                                for v in range(N_VOICES)],
                     Params(vca_gate=True, cutoff=0.3, env_amt=0.5, sustain=0,
                            decay=adsr_ui_to_rate(3000))),
+    # ladder: resonant envelope sweep, and self-oscillation ringing
+    "ladder_sweep": (lambda s: [Note(0, 36, 0.0, s * 0.45), Note(1, 43, s * 0.5, s * 0.95)],
+                     Params(cutoff=0.15, env_amt=0.75, res=0.85, sustain=8000,
+                            decay=adsr_ui_to_rate(5000), release=adsr_ui_to_rate(3000))),
+    "ladder_selfosc": (lambda s: [Note(0, 60, 0.0, s * 0.8)],
+                       Params(cutoff=0.6, env_amt=0.0, kbd=1.0, res=1.0, saw=True)),
     # same chord, dark vs bright cutoff knob (no env), back to back
     "cutoff_dark": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),

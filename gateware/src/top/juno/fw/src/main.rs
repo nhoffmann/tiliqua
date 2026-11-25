@@ -123,9 +123,8 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_drive(drive_smooth);
 
         // Map 0-1 UI range to 32768-8192 hardware range (inverted)
-        let reso_ui = u32::from(opts.vcf.reso.value);
-        let reso_hw = (32768 - reso_ui * 24576 / 32768) as u16;
-        let reso_smooth = app.reso_smoother.proc_u16(reso_hw);
+        // Ladder resonance knob 0..32768 (gateware: k = 4.5 res, Q compensation)
+        let reso_smooth = app.reso_smoother.proc_u16(opts.vcf.reso.value);
         app.synth.set_reso(reso_smooth);
 
         let diffuse_smooth = app.diffusion_smoother.proc_u16(opts.effect.diffuse.value);

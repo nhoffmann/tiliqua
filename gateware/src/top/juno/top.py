@@ -56,7 +56,7 @@ the UI.
                                   │    ▼    │
                                   │  ADSR   │ (ADSR sets filter cutoff)
                                   │    ▼    │
-                                  │ Filter  │ (resonance =
+                                  │ Ladder  │ (resonance =
                                   └─────────┘  `reso` setting)
                                   ┌────▼────┐
                                   │Mix L/R  │
@@ -99,7 +99,7 @@ can also be used to control most of these through CCs as follows:
         DCO     noise         21  noise level
 
         VCF     cutoff        26  filter cutoff (exponential)
-        VCF     reso          23  filter resonance
+        VCF     reso          23  ladder resonance (self-oscillates near max)
         VCF     env-amt       27  envelope -> cutoff amount
         VCF     env-pol       28  envelope polarity (+/-)
         VCF     kbd-track     29  keyboard tracking (0 = off, 1 = 100 %)

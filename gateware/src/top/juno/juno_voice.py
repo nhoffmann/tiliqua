@@ -29,7 +29,7 @@ solve...
     .. code-block:: text
 
         MultiJunoOsc ───────┐
-                            ├── BlockMerge ──> MultiSVF (and DC block) ──> VoiceMixer
+                            ├── BlockMerge ──> MultiLadder (+ DC block, VCA) ──> VoiceMixer
         MultiADSR ──────────┘
 """
 
@@ -45,6 +45,12 @@ from amaranth_future import fixed
 
 from tiliqua.dsp import ASQ, mac
 from tiliqua.dsp.block import Block, BlockMerge
+
+# top.py runs as a script (sibling imports); tests / sim_render import the package.
+try:
+    import ladder_model as LM
+except ImportError:
+    from top.juno import ladder_model as LM
 
 
 class PipelinedMAC(mac.MAC):
@@ -674,58 +680,39 @@ class MultiADSR(wiring.Component):
         return m
 
 
-class MultiSVF(wiring.Component):
+class MultiLadder(wiring.Component):
 
     """
-    N oversampled Chamberlin state variable filters with:
-    - Per-voice samples in and envelope
-    - Global resonance (all filters)
-    - LPF output has a DC-blocking stage so 0 cutoff doesn't emit DC
-    - Per-voice VCA after the DC block: output = filtered * env
+    N Juno-style 4-pole ladder low-pass filters (Juno port, layer 1), with the
+    Phase 1b exponential cutoff path, a DC block, the VCA and VCA Gate mode.
 
-    Juno port additions (all on the same multiplier, no extra DSP tile):
+    Bit-exact with ``top.juno.ladder_model.LadderModel`` (see there for the
+    algorithm): zero-delay-feedback TPT ladder, tanh (LUT) on the stage input,
+    resonance ``k = 4.5 res``, Q compensation ``1 + 0.5 res^2``, 2x oversampling
+    (input held, outputs averaged). ``reso`` is the resonance knob 0..32768.
 
-    - Exponential cutoff. Per voice, a cutoff control ``c`` in 'normalized octaves'
-      (0..1 spans ``CUTOFF_OCTAVES`` octaves above ``CUTOFF_F_MIN``) is computed as::
-
-          c = voice_cutoff_base[n] + env_amt * env + 0.8192 * cutoff_cv
-
-      ``voice_cutoff_base`` comes from firmware (knob + keyboard tracking + mod wheel),
-      ``env_amt`` is bipolar, and the CV scaling makes 1 V = 1 octave (ASQ 1.0 = 8.192 V).
-      ``c`` is clamped to [0, 1) and converted to the SVF coefficient by a lookup table.
-    - VCA after the DC block: output = filtered * env.
-
-    Otherwise this is N copies of the one-in-one-out ``SVF`` and ``DCBlock`` from ``dsp.filters``.
+    One ``PipelinedMAC``: ~29 multiplies per voice, ~130 cycles per voice.
     """
 
-    N_OVERSAMPLE = 2
-
-    # Exponential cutoff mapping: c in [0, 1) -> CUTOFF_F_MIN * 2**(c * CUTOFF_OCTAVES) Hz.
-    CUTOFF_F_MIN   = 12.0
-    CUTOFF_OCTAVES = 10
-    CUTOFF_LUT_BITS = 10
-    FS = 48000
+    N_OVERSAMPLE = LM.N_OVERSAMPLE
+    CUTOFF_F_MIN = LM.CUTOFF_F_MIN
+    CUTOFF_OCTAVES = LM.CUTOFF_OCTAVES
+    CUTOFF_LUT_BITS = LM.CUTOFF_LUT_BITS
+    FS = LM.FS
 
     @classmethod
     def cutoff_hz(cls, c):
-        return cls.CUTOFF_F_MIN * 2 ** (c * cls.CUTOFF_OCTAVES)
+        return LM.cutoff_hz(c)
 
     @classmethod
     def cutoff_lut(cls):
-        """SVF coefficient f = 2 sin(pi fc / fs_oversampled), raw SQNative values."""
-        size = 1 << cls.CUTOFF_LUT_BITS
-        fs_os = cls.FS * cls.N_OVERSAMPLE
-        lut = []
-        for i in range(size):
-            fc = cls.cutoff_hz(i / size)
-            lut.append(fixed.Const(2 * math.sin(math.pi * fc / fs_os),
-                                   shape=mac.SQNative)._value)
-        return lut
+        """TPT stage coefficient G = g / (1 + g) (15-bit)."""
+        return LM.g_lut()
 
     def __init__(self, n, sq=ASQ, env_uq=MultiADSR.EnvUQ, macp=None):
         self.n = n
         self.sq = sq
-        self.macp = macp or mac.MAC.default()
+        self.macp = macp or PipelinedMAC()
         super().__init__({
             "i":    In(stream.Signature(Block(data.StructLayout({"x": sq, "env": env_uq})))),
             "reso": In(unsigned(16)),
@@ -734,7 +721,7 @@ class MultiSVF(wiring.Component):
             "cutoff_cv":  In(ASQ),
             # LFO -> cutoff (normalized octaves, added like cutoff_cv but unscaled)
             "cutoff_mod": In(ASQ),
-            # VCA Gate mode: VCA follows gate x velocity (~1.5 ms ramp) instead of env
+            # VCA Gate mode: VCA follows gate x velocity (~0.7 ms ramp) instead of env
             "vca_gate_mode":  In(1),
             "voice_gates":    In(data.ArrayLayout(unsigned(1), n)),
             "voice_velocity": In(data.ArrayLayout(env_uq, n)),
@@ -744,70 +731,92 @@ class MultiSVF(wiring.Component):
     def elaborate(self, platform):
         m = Module()
         N = self.n
+        ONE = LM.ONE
+        SAT = LM.SAT
+        W = 22
         m.submodules.macp = mp = self.macp
 
-        # Per-voice SVF state memory
+        def sat(x):
+            v = Signal(signed(W))
+            with m.If(x > SAT):
+                m.d.comb += v.eq(SAT)
+            with m.Elif(x < -SAT):
+                m.d.comb += v.eq(-SAT)
+            with m.Else():
+                m.d.comb += v.eq(x)
+            return v
 
-        svf_sh = fixed.SQ(mac.SQNative.i_bits, mac.SQNative.f_bits + 2)
+        # per-voice state
         state_layout = data.StructLayout({
-            "abp":  svf_sh,
-            "alp":  svf_sh,
-            "ahp":  svf_sh,
-            "dc_x": svf_sh,
-            "dc_y": svf_sh,
-            "gate_env": unsigned(16),   # Gate-mode VCA level, 15-bit (32768 = 1.0)
+            "s0": signed(18), "s1": signed(18), "s2": signed(18), "s3": signed(18),
+            "dc_x": signed(W), "dc_y": signed(W),
+            "gate_env": unsigned(16),
         })
-        m.submodules.state_mem = state_mem = Memory(
-            shape=state_layout, depth=N, init=[])
+        m.submodules.state_mem = state_mem = Memory(shape=state_layout, depth=N, init=[])
         st_rport = state_mem.read_port()
         st_wport = state_mem.write_port()
         m.d.comb += st_rport.en.eq(1)
 
-        # Working registers
-        svf_abp = Signal(svf_sh)
-        svf_alp = Signal(svf_sh)
-        svf_ahp = Signal(svf_sh)
+        # lookup tables
+        g_lut = LM.g_lut()
+        m.submodules.g_lut = g_mem = Memory(shape=unsigned(16), depth=len(g_lut), init=g_lut)
+        g_rd = g_mem.read_port()
+        tanh_layout = data.StructLayout({"val": unsigned(16), "delta": unsigned(16)})
+        tl = LM.tanh_lut()
+        m.submodules.tanh_lut = tanh_mem = Memory(
+            shape=tanh_layout, depth=len(tl), init=[{"val": a, "delta": b} for a, b in tl])
+        tanh_rd = tanh_mem.read_port()
+        m.d.comb += [g_rd.en.eq(1), tanh_rd.en.eq(1)]
 
-        svf_x     = Signal(mac.SQNative)
-        svf_kK    = Signal(mac.SQNative)
-        svf_kQinv = Signal(mac.SQNative)
-        oversample = Signal(range(self.N_OVERSAMPLE))
+        # MAC: z = (a * b) >> 15
+        mac_a = Signal(mac.SQNative)
+        mac_b = Signal(mac.SQNative)
+        z = Signal(signed(40))
+        m.d.comb += z.eq(mp.result.z.as_value() >> 15)
 
-        # DC block: multiply-free first-order highpass
-        # y[n] = x[n] - x[n-1] + y[n-1] - (y[n-1] >> DC_SHIFT)
-        DC_SHIFT = 9  # 1/512 ≈ 0.998, ~1.5Hz corner at 48kHz
-        dc_x = Signal(svf_sh)
-        dc_y = Signal(svf_sh)
+        def multiply(a, b, assigns, next_state):
+            """``assigns(z)`` -> list of sync statements once a * b is ready."""
+            m.d.comb += [mac_a.as_value().eq(a), mac_b.as_value().eq(b)]
+            with mp.Multiply(m, a=mac_a, b=mac_b):
+                m.d.sync += assigns(z)
+                m.next = next_state
 
-        # VCA: the per-voice envelope scales the output.
-        vca_env = Signal(mac.SQNative)
-        vca_out = Signal(svf_sh)
-
-        # Exponential cutoff: c = base + env_amt * env + cv (normalized octaves)
-        cut_base = Signal(mac.SQNative)
-        cut_amt  = Signal(mac.SQNative)
-        cut_cv   = Signal(mac.SQNative)
-        cut_mod  = Signal(mac.SQNative)
-        m.d.comb += cut_mod.eq(self.cutoff_mod)
-        gate_env = Signal(16)
-        GATE_STEP = 1 << 10   # 1/32 per sample: ~0.7 ms full-scale ramp at 48 kHz
-        cut_c    = Signal(mac.SQNative)
-        m.d.comb += [
-            cut_amt.eq(self.env_amt),
-            # 0.8192 ~= 1 - 1/8 - 1/16 + 1/128 (0.13 % error): 1 V/oct on the CV input
-            cut_cv.eq(self.cutoff_cv - (self.cutoff_cv >> 3) - (self.cutoff_cv >> 4)
-                      + (self.cutoff_cv >> 7)),
-        ]
-        lut = self.cutoff_lut()
-        m.submodules.cutoff_lut = cutoff_mem = Memory(
-            shape=signed(mac.SQNative.as_shape().width), depth=len(lut), init=lut)
-        lut_rport = cutoff_mem.read_port()
-        m.d.comb += lut_rport.en.eq(1)
-        idx_shift = mac.SQNative.f_bits - self.CUTOFF_LUT_BITS
-        idx_max = len(lut) - 1
-
-        in_first = Signal(1)
         voice_ix = Signal(range(N))
+        in_first = Signal()
+        x       = Signal(signed(W))
+        env15   = Signal(signed(W))
+        s       = [Signal(signed(18), name=f"s{i}") for i in range(4)]
+        dc_x    = Signal(signed(W))
+        dc_y    = Signal(signed(W))
+        gate_env = Signal(16)
+        cut_base = Signal(signed(W))
+        c       = Signal(signed(W))
+        G       = Signal(signed(W))
+        beta    = Signal(signed(W))
+        k_half  = Signal(signed(W))
+        comp    = Signal(signed(W))
+        xc      = Signal(signed(W))
+        G2      = Signal(signed(W))
+        G4      = Signal(signed(W))
+        e       = Signal(signed(W))
+        inv     = Signal(signed(W))
+        t       = Signal(signed(W))
+        S       = Signal(signed(W))
+        kS      = Signal(signed(W))
+        u       = Signal(signed(W))
+        u_abs   = Signal(18)
+        u_neg   = Signal()
+        t_val   = Signal(signed(W))
+        t_delta = Signal(signed(W))
+        xi      = Signal(signed(W))
+        acc     = Signal(signed(W))
+        os_ix   = Signal(range(self.N_OVERSAMPLE))
+        vca     = Signal(signed(W))
+        out     = Signal(signed(16))
+
+        cv_raw = self.cutoff_cv.as_value()
+        cv_scaled = Signal(signed(W))
+        m.d.comb += cv_scaled.eq(cv_raw - (cv_raw >> 3) - (cv_raw >> 4) + (cv_raw >> 7))
 
         with m.FSM():
 
@@ -815,20 +824,19 @@ class MultiSVF(wiring.Component):
                 m.d.comb += self.i.ready.eq(1)
                 with m.If(self.i.valid):
                     m.d.sync += [
-                        svf_x.eq(self.i.payload.sample.x >> 1),
-                        vca_env.eq(self.i.payload.sample.env),
-                        svf_kQinv.as_value().eq(self.reso),
+                        x.eq(self.i.payload.sample.x.as_value()),
+                        env15.eq(self.i.payload.sample.env.as_value() >> 1),
                         in_first.eq(self.i.payload.first),
-                        oversample.eq(0),
+                        os_ix.eq(0),
+                        acc.eq(0),
                     ]
                     m.d.comb += st_rport.addr.eq(voice_ix)
                     m.next = 'LOAD'
 
             with m.State('LOAD'):
                 m.d.sync += [
-                    svf_abp.eq(st_rport.data.abp),
-                    svf_alp.eq(st_rport.data.alp),
-                    svf_ahp.eq(st_rport.data.ahp),
+                    s[0].eq(st_rport.data.s0), s[1].eq(st_rport.data.s1),
+                    s[2].eq(st_rport.data.s2), s[3].eq(st_rport.data.s3),
                     dc_x.eq(st_rport.data.dc_x),
                     dc_y.eq(st_rport.data.dc_y),
                     gate_env.eq(st_rport.data.gate_env),
@@ -836,68 +844,110 @@ class MultiSVF(wiring.Component):
                 with m.Switch(voice_ix):
                     for n in range(N):
                         with m.Case(n):
-                            m.d.sync += cut_base.eq(self.voice_cutoff_base[n])
-                m.next = 'CUTOFF-MUL'
+                            m.d.sync += cut_base.eq(self.voice_cutoff_base[n].as_value())
+                m.next = 'CUT-MUL'
 
-            with m.State('CUTOFF-MUL'):
-                # c = base + env_amt * env + cv
-                with mp.Multiply(m, a=vca_env, b=cut_amt):
-                    m.d.sync += cut_c.eq(cut_base + mp.result.z + cut_cv + cut_mod)
-                    m.next = 'CUTOFF-ADDR'
+            # --- exponential cutoff -> G -------------------------------------
+            with m.State('CUT-MUL'):
+                multiply(env15, self.env_amt.as_value(), lambda z: [
+                    c.eq(cut_base + z + cv_scaled + self.cutoff_mod.as_value())], 'CUT-ADDR')
 
-            with m.State('CUTOFF-ADDR'):
-                # clamp c to [0, 1) and look up the SVF coefficient
-                c_raw = cut_c.as_value()
-                with m.If(c_raw < 0):
-                    m.d.comb += lut_rport.addr.eq(0)
-                with m.Elif((c_raw >> idx_shift) > idx_max):
-                    m.d.comb += lut_rport.addr.eq(idx_max)
+            with m.State('CUT-ADDR'):
+                idx_shift = 15 - self.CUTOFF_LUT_BITS
+                idx_max = (1 << self.CUTOFF_LUT_BITS) - 1
+                with m.If(c < 0):
+                    m.d.comb += g_rd.addr.eq(0)
+                with m.Elif((c >> idx_shift) > idx_max):
+                    m.d.comb += g_rd.addr.eq(idx_max)
                 with m.Else():
-                    m.d.comb += lut_rport.addr.eq(c_raw >> idx_shift)
-                m.next = 'CUTOFF-READ'
+                    m.d.comb += g_rd.addr.eq(c >> idx_shift)
+                m.next = 'CUT-READ'
 
-            with m.State('CUTOFF-READ'):
-                m.d.sync += svf_kK.as_value().eq(lut_rport.data)
-                m.next = 'SVF-MAC0'
+            with m.State('CUT-READ'):
+                m.d.sync += [G.eq(g_rd.data), beta.eq(ONE - g_rd.data)]
+                m.next = 'K-HALF'
 
-            with m.State('SVF-MAC0'):
-                # alp = abp*kK + alp
-                with mp.Multiply(m, a=svf_abp, b=svf_kK):
-                    m.d.sync += svf_alp.eq(mp.result.z + svf_alp)
-                    m.next = 'SVF-MAC1'
+            # --- per-sample coefficients --------------------------------------
+            with m.State('K-HALF'):
+                multiply(self.reso, LM.K_HALF_SCALE, lambda z: [k_half.eq(z)], 'COMP')
+            with m.State('COMP'):
+                multiply(self.reso, self.reso, lambda z: [comp.eq(ONE + (z >> 1))], 'XCOMP')
+            with m.State('XCOMP'):
+                multiply(x, comp, lambda z: [xc.eq(z)], 'G2')
+            with m.State('G2'):
+                multiply(G, G, lambda z: [G2.eq(z)], 'G4')
+            with m.State('G4'):
+                multiply(G2, G2, lambda z: [G4.eq(z)], 'E')
+            with m.State('E'):
+                multiply(k_half, G4, lambda z: [e.eq(2 * z)], 'INV')
+            with m.State('INV'):
+                multiply(e, e, lambda z: [inv.eq(ONE - e + z)], 'S1')
 
-            with m.State('SVF-MAC1'):
-                # ahp = abp*(-kQinv) + (x - alp)
-                with mp.Multiply(m, a=svf_abp, b=-svf_kQinv):
-                    m.d.sync += svf_ahp.eq(mp.result.z + (svf_x - svf_alp))
-                    m.next = 'SVF-MAC2'
+            # --- one filter iteration (x2) ------------------------------------
+            with m.State('S1'):
+                multiply(G, s[0], lambda z: [t.eq(z)], 'S2')
+            with m.State('S2'):
+                multiply(G, t + s[1], lambda z: [t.eq(z)], 'S3')
+            with m.State('S3'):
+                multiply(G, t + s[2], lambda z: [t.eq(z)], 'S4')
+            with m.State('S4'):
+                multiply(beta, t + s[3], lambda z: [S.eq(z)], 'KS')
+            with m.State('KS'):
+                multiply(k_half, S, lambda z: [kS.eq(sat(2 * z))], 'U')
+            with m.State('U'):
+                multiply(sat(xc - kS), inv, lambda z: [u.eq(z)], 'TANH-ADDR')
 
-            with m.State('SVF-MAC2'):
-                # abp = ahp*kK + abp
-                with mp.Multiply(m, a=svf_ahp, b=svf_kK):
-                    m.d.sync += svf_abp.eq(mp.result.z + svf_abp)
-                    m.next = 'SVF-OVER'
+            with m.State('TANH-ADDR'):
+                a = Signal(18)
+                m.d.comb += a.eq(Mux(u < 0, -u, u))
+                a_cl = Signal(17)
+                m.d.comb += a_cl.eq(Mux(a > (1 << 17) - 1, (1 << 17) - 1, a))
+                m.d.comb += tanh_rd.addr.eq(a_cl >> LM.TANH_FRAC_BITS)
+                m.d.sync += [u_abs.eq(a_cl), u_neg.eq(u < 0)]
+                m.next = 'TANH-READ'
 
-            with m.State('SVF-OVER'):
-                with m.If(oversample == self.N_OVERSAMPLE - 1):
+            with m.State('TANH-READ'):
+                # latch the LUT output: the read address is only valid for one cycle,
+                # but the multiply below needs stable operands for its whole latency
+                m.d.sync += [
+                    t_val.eq(tanh_rd.data.val),
+                    t_delta.eq(tanh_rd.data.delta.as_signed()),
+                ]
+                m.next = 'TANH-INT'
+
+            with m.State('TANH-INT'):
+                frac = (u_abs & ((1 << LM.TANH_FRAC_BITS) - 1)) << (15 - LM.TANH_FRAC_BITS)
+                tv = Signal(signed(W))
+                m.d.comb += tv.eq(t_val + z)
+                multiply(t_delta, frac, lambda z: [xi.eq(Mux(u_neg, -tv, tv))], 'STG0')
+
+            for i in range(4):
+                with m.State(f'STG{i}'):
+                    nxt = f'STG{i + 1}' if i < 3 else 'ACC'
+                    def stage(z, i=i):
+                        y = sat(z + s[i])
+                        return [s[i].eq(sat(y + z)), xi.eq(y)]
+                    multiply(G, sat(xi - s[i]), stage, nxt)
+
+            with m.State('ACC'):
+                m.d.sync += acc.eq(acc + xi)
+                with m.If(os_ix == self.N_OVERSAMPLE - 1):
                     m.next = 'DC-BLOCK'
                 with m.Else():
-                    m.d.sync += oversample.eq(oversample + 1)
-                    m.next = 'SVF-MAC0'
+                    m.d.sync += os_ix.eq(os_ix + 1)
+                    m.next = 'S1'
 
+            # --- DC block, gate level, VCA ------------------------------------
             with m.State('DC-BLOCK'):
-                # Multiply-free DC blocking highpass on SVF lowpass output.
-                svf_out = svf_alp >> 1
+                o = Signal(signed(W))
+                m.d.comb += o.eq(acc >> 2)
                 m.d.sync += [
-                    dc_y.eq(svf_out - dc_x + dc_y - (dc_y >> DC_SHIFT)),
-                    dc_x.eq(svf_out),
+                    dc_y.eq(o - dc_x + dc_y - (dc_y >> LM.DC_SHIFT)),
+                    dc_x.eq(o),
                 ]
                 m.next = 'GATE-ENV'
 
             with m.State('GATE-ENV'):
-                # Gate mode: per-voice level ramps toward velocity (gate on) or 0
-                # (gate off) by 1/32 per sample, avoiding clicks. Always tracked,
-                # so switching modes doesn't jump.
                 cur_gate = Signal()
                 cur_vel = Signal(16)
                 with m.Switch(voice_ix):
@@ -909,29 +959,29 @@ class MultiSVF(wiring.Component):
                             ]
                 target = Signal(16)
                 m.d.comb += target.eq(Mux(cur_gate, cur_vel, 0))
-                new_gate_env = Signal(16)
-                with m.If(gate_env + GATE_STEP <= target):
-                    m.d.comb += new_gate_env.eq(gate_env + GATE_STEP)
-                with m.Elif(gate_env >= target + GATE_STEP):
-                    m.d.comb += new_gate_env.eq(gate_env - GATE_STEP)
+                new_ge = Signal(16)
+                with m.If(gate_env + LM.GATE_STEP <= target):
+                    m.d.comb += new_ge.eq(gate_env + LM.GATE_STEP)
+                with m.Elif(gate_env >= target + LM.GATE_STEP):
+                    m.d.comb += new_ge.eq(gate_env - LM.GATE_STEP)
                 with m.Else():
-                    m.d.comb += new_gate_env.eq(target)
-                m.d.sync += gate_env.eq(new_gate_env)
-                with m.If(self.vca_gate_mode):
-                    m.d.sync += vca_env.as_value().eq(new_gate_env)
+                    m.d.comb += new_ge.eq(target)
+                m.d.sync += [
+                    gate_env.eq(new_ge),
+                    vca.eq(Mux(self.vca_gate_mode, new_ge, env15)),
+                ]
                 m.next = 'VCA'
 
             with m.State('VCA'):
-                with mp.Multiply(m, a=dc_y, b=vca_env):
-                    m.d.sync += vca_out.eq(mp.result.z)
-                    m.next = 'STORE'
+                def vca_out(z):
+                    return [out.eq(Mux(z > ONE - 1, ONE - 1, Mux(z < -ONE, -ONE, z)))]
+                multiply(sat(dc_y), vca, vca_out, 'STORE')
 
             with m.State('STORE'):
                 m.d.comb += [
                     st_wport.addr.eq(voice_ix),
-                    st_wport.data.abp.eq(svf_abp),
-                    st_wport.data.alp.eq(svf_alp),
-                    st_wport.data.ahp.eq(svf_ahp),
+                    st_wport.data.s0.eq(s[0]), st_wport.data.s1.eq(s[1]),
+                    st_wport.data.s2.eq(s[2]), st_wport.data.s3.eq(s[3]),
                     st_wport.data.dc_x.eq(dc_x),
                     st_wport.data.dc_y.eq(dc_y),
                     st_wport.data.gate_env.eq(gate_env),
@@ -943,7 +993,7 @@ class MultiSVF(wiring.Component):
                 m.d.comb += [
                     self.o.valid.eq(1),
                     self.o.payload.first.eq(in_first),
-                    self.o.payload.sample.eq(vca_out),
+                    self.o.payload.sample.as_value().eq(out),
                 ]
                 with m.If(self.o.ready):
                     with m.If(voice_ix == N - 1):
@@ -1037,7 +1087,7 @@ class JunoVoice(wiring.Component):
 
             # Global synth parameters (from CSR)
             "reso":           In(unsigned(16)),
-            # Exponential cutoff (see MultiSVF): per-voice base from firmware,
+            # Exponential cutoff (see MultiLadder): per-voice base from firmware,
             # bipolar env amount, cutoff CV (1 V/oct)
             "voice_cutoff_base": In(data.ArrayLayout(ASQ, self.n_voices)),
             "env_amt":        In(ASQ),
@@ -1073,8 +1123,8 @@ class JunoVoice(wiring.Component):
         m.submodules.osc = osc = MultiJunoOsc(n=N, sq=sq)
         m.submodules.adsr = adsr = MultiADSR(n=N)
         m.submodules.merge = merge = BlockMerge({"x": sq, "env": MultiADSR.EnvUQ})
-        # Pipelined multiplier: keeps the 60 MHz domain clear of the SVF MAC path
-        m.submodules.svf = svf = MultiSVF(n=N, sq=sq, macp=PipelinedMAC())
+        # Juno 4-pole ladder (layer 1) with cutoff path, DC block, VCA, Gate mode
+        m.submodules.svf = svf = MultiLadder(n=N, sq=sq, macp=PipelinedMAC())
         m.submodules.mixer = mixer = VoiceMixer(n=N, sq=sq)
 
         # Wire external ports -> internal components

@@ -16,7 +16,7 @@ Per audio frame (``tick``):
 3. ``lfo = s * amp``.
 4. Routes:
    - ``vib = lfo * dco_depth`` (pitch offset, 1/1024 semitones),
-   - ``cutoff_mod = lfo * vcf_depth`` (normalized octaves, see ``MultiSVF``),
+   - ``cutoff_mod = lfo * vcf_depth`` (normalized octaves, see ``MultiLadder``),
    - PWM: ``k = knob`` (manual) or ``knob * (lfo + 1) / 2`` (LFO mode), then the
      256-entry ``pw_curve_lut`` maps the knob to the pulse rising-edge phase.
 

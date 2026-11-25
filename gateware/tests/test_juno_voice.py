@@ -18,9 +18,11 @@ from amaranth.sim import Simulator
 
 from amaranth_future import fixed
 
-from top.juno.juno_voice import MultiJunoOsc, MultiSVF, PipelinedMAC, PitchToInc
+from tiliqua.dsp import ASQ
+from top.juno.juno_voice import MultiADSR, MultiJunoOsc, MultiLadder, PipelinedMAC, PitchToInc
 from top.juno.juno_lfo import JunoLfo, JunoLfoModel
 from top.juno.osc_model import OscModel
+from top.juno.ladder_model import LadderModel
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point, render
 
@@ -141,6 +143,97 @@ class JunoVoiceTests(unittest.TestCase):
                          f"expected {[expected[i] for i in mismatches[:3]]}")
         self.assertGreater(np.std(got), 1000)   # not silent
 
+    def test_ladder_matches_model(self):
+        """MultiLadder gateware is bit-exact with LadderModel: 3 voices, saw +
+        noise inputs, changing envelopes, high resonance, all cutoff inputs,
+        Gate mode switched on halfway."""
+        n_voices, n_frames = 3, 400
+        rng = random.Random(7)
+        cfg = dict(env_amt=13107, cutoff_cv=-1200, cutoff_mod=900, res=31130)
+        bases = [8000, 14000, 20000]
+        velocity = 50000
+
+        def inputs(f, v):
+            ph = (f * (0.011 + 0.017 * v)) % 1.0
+            x = int((ph * 2 - 1) * 26000) + rng.randrange(-800, 800)
+            env = min(65535, f * 400) if f < 200 else max(0, 65535 - (f - 200) * 300)
+            gate = int(f < 300)
+            gate_mode = int(f >= 200)
+            return x, env, gate, gate_mode
+
+        frames = [[inputs(f, v) for v in range(n_voices)] for f in range(n_frames)]
+        m = Module()
+        m.submodules.dut = dut = MultiLadder(n=n_voices)
+        got = []
+
+        async def testbench(ctx):
+            ctx.set(dut.reso, cfg["res"])
+            ctx.set(dut.env_amt.as_value(), cfg["env_amt"])
+            ctx.set(dut.cutoff_cv.as_value(), cfg["cutoff_cv"])
+            ctx.set(dut.cutoff_mod.as_value(), cfg["cutoff_mod"])
+            for v in range(n_voices):
+                ctx.set(dut.voice_cutoff_base[v].as_value(), bases[v])
+                ctx.set(dut.voice_velocity[v].as_value(), velocity)
+            for fr in frames:
+                for v, (x, env, gate, gate_mode) in enumerate(fr):
+                    ctx.set(dut.voice_gates[v], gate)
+                    ctx.set(dut.vca_gate_mode, gate_mode)
+                    await stream.put(ctx, dut.i, {"first": v == 0,
+                                                  "sample": {"x": fixed.Const(x / 32768, shape=ASQ),
+                                                             "env": fixed.Const(env / 65536, shape=MultiADSR.EnvUQ)}})
+                    got.append(round((await stream.get(ctx, dut.o)).sample.as_float() * 32768))
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+        model = LadderModel(n_voices)
+        expected = []
+        for fr in frames:
+            for v, (x, env, gate, gate_mode) in enumerate(fr):
+                expected.append(model.voice(v, x, env, base=bases[v], gate=gate,
+                                            velocity=velocity, gate_mode=gate_mode, **cfg))
+        mismatches = [i for i, (a, b) in enumerate(zip(got, expected)) if a != b]
+        self.assertEqual(mismatches[:5], [], f"got {[got[i] for i in mismatches[:3]]}, "
+                         f"expected {[expected[i] for i in mismatches[:3]]}")
+        self.assertGreater(np.std(got), 300)
+
+    # --- Ladder behaviour (model is bit-exact with the gateware) --------------
+
+    @staticmethod
+    def _ladder(x, c, res):
+        model = LadderModel(1)
+        return np.array([model.voice(0, int(v), 65535, base=int(c * 32768), env_amt=0,
+                                     cutoff_cv=0, cutoff_mod=0, res=int(res * 32768))
+                         for v in x]) / 32768
+
+    def _gain_db(self, f, c, res):
+        t = np.arange(6000) / FS
+        y = self._ladder(0.2 * 32768 * np.sin(2 * np.pi * f * t), c, res)[3000:]
+        return 20 * np.log10(np.sqrt(2) * np.std(y) / 0.2 + 1e-12)
+
+    def test_ladder_24db_slope(self):
+        """4-pole low-pass: >= 20 dB per octave well above cutoff."""
+        fc = MultiLadder.cutoff_hz(0.5)
+        self.assertGreater(self._gain_db(2 * fc, 0.5, 0.0) - self._gain_db(4 * fc, 0.5, 0.0), 20)
+
+    def test_ladder_resonance_peak(self):
+        """High resonance: the response at cutoff rises above the passband."""
+        fc = MultiLadder.cutoff_hz(0.5)
+        passband = self._gain_db(fc / 4, 0.5, 0.9)
+        self.assertGreater(self._gain_db(fc, 0.5, 0.9), passband + 6)
+        self.assertLess(self._gain_db(fc, 0.5, 0.0), self._gain_db(fc / 4, 0.5, 0.0))
+
+    def test_ladder_self_oscillates(self):
+        """Max resonance + a kick: sustained oscillation near the cutoff frequency."""
+        x = np.zeros(24000)
+        x[0] = 0.5 * 32768
+        y = self._ladder(x, 0.5, 1.0)
+        self.assertGreater(np.std(y[-4800:]), 0.02)
+        f = estimate_freq(y[-8192:])
+        self.assertLess(abs(np.log2(f / MultiLadder.cutoff_hz(0.5))), 0.5)
+
     def test_juno_lfo_matches_model(self):
         """JunoLfo gateware is bit-exact with JunoLfoModel: fast rate (several
         cycles), delay ramp restarted by a new note after all keys released,
@@ -246,11 +339,11 @@ class JunoVoiceTests(unittest.TestCase):
 
     def test_cutoff_lut(self):
         """LUT is monotonic and spans 12 Hz .. ~12 kHz over 10 octaves."""
-        lut = MultiSVF.cutoff_lut()
+        lut = MultiLadder.cutoff_lut()
         self.assertTrue(all(b >= a for a, b in zip(lut, lut[1:])))
-        self.assertAlmostEqual(MultiSVF.cutoff_hz(0.0), 12.0)
-        self.assertAlmostEqual(MultiSVF.cutoff_hz(0.5), 12.0 * 32)
-        self.assertGreater(MultiSVF.cutoff_hz(1023 / 1024), 12000)
+        self.assertAlmostEqual(MultiLadder.cutoff_hz(0.0), 12.0)
+        self.assertAlmostEqual(MultiLadder.cutoff_hz(0.5), 12.0 * 32)
+        self.assertGreater(MultiLadder.cutoff_hz(1023 / 1024), 12000)
 
     def test_cutoff_knob_brightness(self):
         """Higher cutoff knob -> brighter sound."""
@@ -271,8 +364,11 @@ class JunoVoiceTests(unittest.TestCase):
         (two octaves up -> ~4x centroid). kbd=0: much less than 4x."""
         ratios = {}
         for kbd in (0.0, 1.0):
-            lo = self._centroid(note=48, cutoff=0.45, env_amt=0.0, kbd=kbd)
-            hi = self._centroid(note=72, cutoff=0.45, env_amt=0.0, kbd=kbd)
+            # cutoff 0.55 (~540 Hz at C4): with the 24 dB ladder a lower cutoff sits
+            # between the two notes and the high note's brightness follows its pitch
+            # even without tracking (ratio -> ~3 at cutoff 0.45)
+            lo = self._centroid(note=48, cutoff=0.55, env_amt=0.0, kbd=kbd)
+            hi = self._centroid(note=72, cutoff=0.55, env_amt=0.0, kbd=kbd)
             ratios[kbd] = hi / lo
         self.assertAlmostEqual(ratios[1.0], 4.0, delta=0.6)
         self.assertLess(ratios[0.0], 3.0)

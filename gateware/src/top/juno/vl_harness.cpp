@@ -80,6 +80,8 @@ int main(int argc, char **argv) {
         {"reso",           [&](int64_t v) { top->reso = v; }},
         {"env_amt",        [&](int64_t v) { top->env_amt = v & 0xFFFF; }},
         {"cutoff_cv",      [&](int64_t v) { top->cutoff_cv = v & 0xFFFF; }},
+        {"hpf_mode",       [&](int64_t v) { top->hpf_mode = v; }},
+        {"chorus_mode",    [&](int64_t v) { top->chorus_mode = v; }},
     };
 
     long n_samples = 0;

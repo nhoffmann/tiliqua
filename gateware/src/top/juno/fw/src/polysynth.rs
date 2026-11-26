@@ -33,15 +33,9 @@ impl Polysynth0 {
         ]
     }
 
-    pub fn set_matrix_coefficient(&mut self, o_x: u32, i_y: u32, value: i32)  {
-        // TODO: statically verify x_o, y_i both < 16. Should be true for any normal use case
-        // as matrices larger than this won't be able to process things at audio rate.
-        while self.registers.matrix_busy().read().bits() == 1 { /* wait until last coeff written */ }
-        self.registers.matrix().write(|w| unsafe {
-            w.o_x().bits(o_x as u8);
-            w.i_y().bits(i_y as u8);
-            w.value().bits(value as u32 & 0x00FFFFFF)
-        } );
+    /// HPF position (0 boost, 1 flat, 2 240 Hz, 3 720 Hz) and chorus (0 off, 1 I, 2 II, 3 I+II).
+    pub fn set_fx(&mut self, hpf: u8, chorus: u8)  {
+        self.registers.fx().write(|w| unsafe { w.hpf().bits(hpf).chorus().bits(chorus) } );
     }
 
     pub fn set_drive(&mut self, value: u16)  {

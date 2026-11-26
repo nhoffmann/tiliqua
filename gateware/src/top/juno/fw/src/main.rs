@@ -128,19 +128,7 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         let reso_smooth = app.reso_smoother.proc_u16(vcf::res_knob_to_reg(opts.vcf.reso.value));
         app.synth.set_reso(reso_smooth);
 
-        let diffuse_smooth = app.diffusion_smoother.proc_u16(opts.effect.diffuse.value);
-        let coeff_dry: i32 = i32::from(32768 - diffuse_smooth);
-        let coeff_wet: i32 = i32::from(diffuse_smooth);
-
-        app.synth.set_matrix_coefficient(0, 0, coeff_dry);
-        app.synth.set_matrix_coefficient(1, 1, coeff_dry);
-        app.synth.set_matrix_coefficient(2, 2, coeff_dry);
-        app.synth.set_matrix_coefficient(3, 3, coeff_dry);
-
-        app.synth.set_matrix_coefficient(0, 4, coeff_wet);
-        app.synth.set_matrix_coefficient(1, 5, coeff_wet);
-        app.synth.set_matrix_coefficient(2, 6, coeff_wet);
-        app.synth.set_matrix_coefficient(3, 7, coeff_wet);
+        app.synth.set_fx(opts.vcf.hpf.value as u8, opts.effect.chorus.value as u8);
 
         // Exponential cutoff (normalized octaves, 32768 = 1.0 = 10 octaves).
         // Per voice: knob + keyboard tracking (relative to C4) + mod wheel.
@@ -229,6 +217,7 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(28, global_index(opts, &opts.vcf.env_pol),     CcMapMode::Absolute);
     m.add(29, global_index(opts, &opts.vcf.kbd_track),   CcMapMode::Absolute);
     m.add(34, global_index(opts, &opts.vcf.lfo),         CcMapMode::Absolute);
+    m.add(36, global_index(opts, &opts.vcf.hpf),         CcMapMode::Absolute);
     // ADSR page (CC 30-33)
     m.add(30, global_index(opts, &opts.adsr.attack),  CcMapMode::Absolute);
     m.add(31, global_index(opts, &opts.adsr.decay),   CcMapMode::Absolute);
@@ -237,7 +226,7 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(35, global_index(opts, &opts.adsr.vca_mode), CcMapMode::Absolute);
     // Effect page (CC 40-41)
     m.add(40, global_index(opts, &opts.effect.drive),    CcMapMode::Absolute);
-    m.add(41, global_index(opts, &opts.effect.diffuse),  CcMapMode::Absolute);
+    m.add(41, global_index(opts, &opts.effect.chorus),   CcMapMode::Absolute);
     m
 }
 
@@ -250,7 +239,6 @@ struct App {
     synth: Polysynth0,
     drive_smoother: OnePoleSmoother,
     reso_smoother: OnePoleSmoother,
-    diffusion_smoother: OnePoleSmoother,
     cutoff_smoother: OnePoleSmoother,
     // last mod wheel (CC1) value, 0..127
     mod_wheel: u8,
@@ -264,7 +252,6 @@ impl App {
     pub fn new(ui: Ui, mut synth: Polysynth0) -> Self {
         let drive_smoother = OnePoleSmoother::new(0.05f32);
         let reso_smoother = OnePoleSmoother::new(0.05f32);
-        let diffusion_smoother = OnePoleSmoother::new(0.05f32);
         let cutoff_smoother = OnePoleSmoother::new(0.05f32);
         let cc_mapper = build_cc_mapper(&ui.opts);
         synth.usb_host_midi(1, 1);
@@ -274,7 +261,6 @@ impl App {
             synth,
             drive_smoother,
             reso_smoother,
-            diffusion_smoother,
             cutoff_smoother,
             mod_wheel: 0,
             last_lfo_knobs: None,

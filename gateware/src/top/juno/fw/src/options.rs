@@ -23,6 +23,35 @@ pub enum Switch {
     On,
 }
 
+// Juno HPF positions (JunoFx): bass boost, flat, 240 Hz, 720 Hz.
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum HpfMode {
+    Boost = 0,
+    #[default]
+    Flat = 1,
+    #[strum(serialize = "240hz")]
+    Hz240 = 2,
+    #[strum(serialize = "720hz")]
+    Hz720 = 3,
+}
+
+// Juno chorus (JunoFx): off, I, II, I+II.
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum ChorusMode {
+    #[default]
+    Off = 0,
+    #[strum(serialize = "I")]
+    I = 1,
+    #[strum(serialize = "II")]
+    II = 2,
+    #[strum(serialize = "I+II")]
+    Both = 3,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
 #[strum(serialize_all = "kebab-case")]
 pub enum PwmMode {
@@ -100,7 +129,6 @@ int_params!(CutoffParams<u16>     { step: 512, min: 0, max: 32768, format: IntFo
 int_params!(EnvAmtParams<u16>     { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(KbdTrackParams<u16>   { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(ResoParams<u16>       { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
-int_params!(DiffuseParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(AdsrTimeParams<u16>  { step: 1024, min: 0, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
 int_params!(AdsrLevelParams<u16> { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(ScrollParams<u8>      { step: 1, min: 0, max: 125 });
@@ -158,14 +186,16 @@ pub struct VcfOpts {
     pub kbd_track: IntOption<KbdTrackParams>,
     #[option(0)]
     pub lfo: IntOption<LevelParams>,
+    #[option]
+    pub hpf: EnumOption<HpfMode>,
 }
 
 #[derive(OptionPage, Clone)]
 pub struct EffectOpts {
     #[option(8192)]
     pub drive: IntOption<DriveParams>,
-    #[option(12288)]
-    pub diffuse: IntOption<DiffuseParams>,
+    #[option]
+    pub chorus: EnumOption<ChorusMode>,
 }
 
 #[derive(OptionPage, Clone)]

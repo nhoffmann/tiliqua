@@ -94,6 +94,9 @@ class Params:
     dco_lfo_semi: float = 0.0   # vibrato depth, semitones at full LFO
     vcf_lfo:      float = 0.0   # LFO -> cutoff, normalized octaves (0.1 = 1 octave)
     vca_gate:     bool = False  # VCA Gate mode instead of envelope
+    # Global effects (firmware defaults: HPF flat, chorus off)
+    hpf:    int = 1             # 0 bass boost, 1 flat, 2 240 Hz, 3 720 Hz
+    chorus: int = 0             # 0 off, 1 I, 2 II, 3 I+II
 
 
 def _raw(value, shape):
@@ -131,6 +134,8 @@ def prepare(notes, seconds, params=None):
         "reso":           res_knob_to_reg(params.res),   # KR-106-calibrated curve
         "env_amt":        _raw(params.env_amt, ASQ),
         "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
+        "hpf_mode":       params.hpf,
+        "chorus_mode":    params.chorus,
     }
     events = []
     for n in notes:
@@ -245,6 +250,16 @@ SCENES = {
                             decay=adsr_ui_to_rate(5000), release=adsr_ui_to_rate(3000))),
     "ladder_selfosc": (lambda s: [Note(0, 60, 0.0, s * 0.8)],
                        Params(cutoff=0.6, env_amt=0.0, kbd=1.0, res=1.0, saw=True)),
+    # Phase 3: chorus modes and HPF positions on a pad chord
+    **{f"chorus_{name}": (lambda s: [Note(0, 48, 0.0, s * 0.85), Note(1, 55, 0.0, s * 0.85),
+                                     Note(2, 60, 0.0, s * 0.85), Note(3, 64, 0.0, s * 0.85)],
+                          Params(cutoff=0.65, env_amt=0.15, res=0.2, chorus=mode,
+                                 attack=adsr_ui_to_rate(1500), sustain=50000,
+                                 release=adsr_ui_to_rate(3000)))
+       for name, mode in (("off", 0), ("I", 1), ("II", 2), ("I_II", 3))},
+    **{f"hpf_{pos}": (lambda s: [Note(0, 36, 0.0, s * 0.85)],
+                      Params(cutoff=0.8, env_amt=0.0, saw=True, sub=0.6, hpf=pos))
+       for pos in range(4)},
     # same chord, dark vs bright cutoff knob (no env), back to back
     "cutoff_dark": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),

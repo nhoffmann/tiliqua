@@ -684,6 +684,19 @@ class MultiADSR(wiring.Component):
         return m
 
 
+def clamp_bits(m, x, bits):
+    """Saturate ``x`` to a signed ``bits``-wide range [-2**(bits-1), 2**(bits-1) - 1].
+    Checks that all bits above ``bits - 1`` equal the sign (a few LUTs), instead of
+    two full-width comparisons (carry chains) per call site."""
+    x = Value.cast(x)
+    v = Signal(signed(bits))
+    upper = x[bits - 1:]
+    in_range = (upper == 0) | (upper == (1 << len(upper)) - 1)
+    m.d.comb += v.eq(Mux(in_range, x[:bits].as_signed(),
+                         Mux(x[-1], -(1 << (bits - 1)), (1 << (bits - 1)) - 1)))
+    return v
+
+
 class MultiLadder(wiring.Component):
 
     """
@@ -742,14 +755,7 @@ class MultiLadder(wiring.Component):
         m.submodules.macp = mp = self.macp
 
         def sat(x):
-            v = Signal(signed(W))
-            with m.If(x > SAT):
-                m.d.comb += v.eq(SAT)
-            with m.Elif(x < -SAT):
-                m.d.comb += v.eq(-SAT)
-            with m.Else():
-                m.d.comb += v.eq(x)
-            return v
+            return clamp_bits(m, x, 18)
 
         # per-voice state
         state_layout = data.StructLayout({
@@ -980,7 +986,7 @@ class MultiLadder(wiring.Component):
 
             with m.State('VCA'):
                 def vca_out(z):
-                    return [out.eq(Mux(z > ONE - 1, ONE - 1, Mux(z < -ONE, -ONE, z)))]
+                    return [out.eq(clamp_bits(m, z, 16))]
                 multiply(sat(dc_y), vca, vca_out, 'STORE')
 
             with m.State('STORE'):
@@ -1012,11 +1018,10 @@ class MultiLadder(wiring.Component):
 
 
 class VoiceMixer(wiring.Component):
-
     """
-    Downmix N voices into a stereo output stream.
-    - Even-indexed voices sum to left, odd-indexed to right
-    - Gain-scaled by 2/N to prevent clipping
+    Sum N voices to mono (Juno: the stereo image comes from the chorus only).
+    Each voice is scaled by 0.75 * 2 / N (polysyn's per-side gain, now summed),
+    the sum saturates instead of wrapping.
     """
 
     def __init__(self, n, sq=ASQ):
@@ -1024,41 +1029,27 @@ class VoiceMixer(wiring.Component):
         self.sq = sq
         super().__init__({
             "i": In(stream.Signature(Block(sq))),
-            "o": Out(stream.Signature(data.ArrayLayout(sq, 2))),
+            "o": Out(stream.Signature(sq)),
         })
 
     def elaborate(self, platform):
         m = Module()
         N = self.n
-
         sq = self.sq
         mix_gain = fixed.Const(0.75 * 2.0 / N, shape=sq)
-
-        acc_l = Signal(sq)
-        acc_r = Signal(sq)
+        acc_sq = fixed.SQ(sq.i_bits + 3, sq.f_bits)   # headroom for N voices
+        acc = Signal(acc_sq)
         voice_ix = Signal(range(N))
 
         with m.FSM():
-
             with m.State('CLEAR'):
-                m.d.sync += [
-                    acc_l.eq(0),
-                    acc_r.eq(0),
-                    voice_ix.eq(0),
-                ]
+                m.d.sync += [acc.eq(0), voice_ix.eq(0)]
                 m.next = 'WAIT-VALID'
 
             with m.State('WAIT-VALID'):
                 m.d.comb += self.i.ready.eq(1)
                 with m.If(self.i.valid):
-                    scaled = self.i.payload.sample * mix_gain
-
-                    # Even voices -> left, odd voices -> right
-                    with m.If(voice_ix[0] == 0):
-                        m.d.sync += acc_l.eq(acc_l + scaled)
-                    with m.Else():
-                        m.d.sync += acc_r.eq(acc_r + scaled)
-
+                    m.d.sync += acc.eq(acc + self.i.payload.sample * mix_gain)
                     with m.If(voice_ix == N - 1):
                         m.next = 'EMIT-OUTPUT'
                     with m.Else():
@@ -1067,8 +1058,7 @@ class VoiceMixer(wiring.Component):
             with m.State('EMIT-OUTPUT'):
                 m.d.comb += [
                     self.o.valid.eq(1),
-                    self.o.payload[0].eq(acc_l),
-                    self.o.payload[1].eq(acc_r),
+                    self.o.payload.eq(acc.saturate(sq)),
                 ]
                 with m.If(self.o.ready):
                     m.next = 'CLEAR'
@@ -1082,8 +1072,8 @@ class JunoVoice(wiring.Component):
         self.n_voices = n_voices
         self.sq = sq
         super().__init__({
-            # Stereo audio output stream
-            "o": Out(stream.Signature(data.ArrayLayout(sq, 2))),
+            # Mono voice sum (stereo comes from the chorus in JunoCore / JunoFx)
+            "o": Out(stream.Signature(sq)),
 
             # Voice control (from MidiVoiceTracker)
             "voice_gates":     In(data.ArrayLayout(unsigned(1), self.n_voices)),

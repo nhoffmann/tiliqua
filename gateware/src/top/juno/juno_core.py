@@ -3,7 +3,8 @@
 ``JunoCore``: the Juno voice engine plus its global LFO, wired the same way for
 the hardware top level (``top.py``) and the offline renderer (``sim_render.py``).
 
-- ``JunoVoice``: 6 voices of DCO -> ADSR -> filter + VCA -> stereo mix.
+- ``JunoVoice``: 6 voices of DCO -> ADSR -> ladder + VCA -> mono sum.
+- ``JunoFx``: 4-position HPF + BBD-style stereo chorus on the mono sum.
 - ``JunoLfo``: one triangle LFO with delay, ticked once per output frame
   (each handshake on ``o``), routed to:
   - pitch: ``voice_pitch = voice_pitch_base + vib`` (vibrato, all voices),
@@ -21,9 +22,11 @@ from tiliqua.dsp import ASQ
 try:
     from juno_voice import JunoVoice, MultiADSR, PipelinedMAC, PitchToInc
     from juno_lfo import JunoLfo
+    from juno_fx import JunoFx
 except ImportError:
     from top.juno.juno_voice import JunoVoice, MultiADSR, PipelinedMAC, PitchToInc
     from top.juno.juno_lfo import JunoLfo
+    from top.juno.juno_fx import JunoFx
 
 
 class JunoCore(wiring.Component):
@@ -59,6 +62,10 @@ class JunoCore(wiring.Component):
             "sustain_level": In(MultiADSR.EnvUQ),
             "release_rate":  In(MultiADSR.EnvUQ),
 
+            # HPF / chorus (JunoFx)
+            "hpf_mode":      In(2),
+            "chorus_mode":   In(2),
+
             # LFO
             "lfo_rate_inc":   In(unsigned(32)),
             "lfo_delay_step": In(unsigned(32)),
@@ -77,6 +84,8 @@ class JunoCore(wiring.Component):
 
         m.submodules.voice = voice = JunoVoice(n_voices=N, sq=self.sq)
         m.submodules.lfo = lfo = JunoLfo(PipelinedMAC())
+        m.submodules.fx = fx = JunoFx(PipelinedMAC())
+        m.d.comb += [fx.hpf_mode.eq(self.hpf_mode), fx.chorus_mode.eq(self.chorus_mode)]
 
         # LFO: one update per output frame
         any_gate = Signal()
@@ -121,6 +130,7 @@ class JunoCore(wiring.Component):
             voice.sustain_level.eq(self.sustain_level),
             voice.release_rate.eq(self.release_rate),
         ]
-        wiring.connect(m, voice.o, wiring.flipped(self.o))
+        wiring.connect(m, voice.o, fx.i)
+        wiring.connect(m, fx.o, wiring.flipped(self.o))
 
         return m

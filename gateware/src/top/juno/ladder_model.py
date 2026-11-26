@@ -63,7 +63,8 @@ def mul(a, b):
 
 
 def sat(x):
-    return max(-SAT, min(SAT, x))
+    """Clamp to the 18-bit signed MAC operand range (as the gateware's clamp_bits)."""
+    return max(-SAT - 1, min(SAT, x))
 
 
 def cutoff_hz(c):

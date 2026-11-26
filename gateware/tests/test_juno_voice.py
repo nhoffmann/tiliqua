@@ -24,6 +24,8 @@ from top.juno.juno_voice import MultiADSR, MultiJunoOsc, MultiLadder, PipelinedM
 from top.juno.juno_lfo import JunoLfo, JunoLfoModel
 from top.juno.osc_model import OscModel
 from top.juno.ladder_model import LadderModel
+from top.juno.fx_model import FxModel
+from top.juno.juno_fx import JunoFx
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
 from top.juno.sim_render import render as render_amaranth
@@ -73,13 +75,23 @@ class JunoVoiceTests(unittest.TestCase):
         out = render([], seconds=200 / FS)
         self.assertEqual(np.abs(out).max(), 0.0)
 
-    def test_voice_panning(self):
-        """Even voices go to the left channel, odd voices to the right."""
-        for voice, active, silent in [(0, 0, 1), (1, 1, 0)]:
+    def test_mono_voice_sum(self):
+        """Voices are summed to mono (Juno): with chorus off, every voice appears
+        identically on both outputs."""
+        for voice in (0, 1):
             with self.subTest(voice=voice):
                 out = render([Note(voice, 60, 0.0, 1.0)], seconds=0.01)
-                self.assertGreater(rms(out[:, active]), 0.01)
-                self.assertEqual(np.abs(out[:, silent]).max(), 0.0)
+                self.assertGreater(rms(out[:, 0]), 0.005)
+                self.assertEqual(np.abs(out[:, 0] - out[:, 1]).max(), 0.0)
+
+    def test_chorus_makes_stereo(self):
+        """Chorus I widens the mono sum: left and right differ, similar level."""
+        p = Params(attack=8192, decay=8192, sustain=65535, release=2048, chorus=1)
+        out = render([Note(0, 60, 0.0, 1.0), Note(1, 64, 0.0, 1.0)], seconds=0.2, params=p)
+        L, R = out[FS // 20:, 0], out[FS // 20:, 1]
+        self.assertGreater(np.mean(L != R), 0.9)
+        self.assertLess(abs(20 * np.log10(rms(L) / rms(R))), 1.0)
+        self.assertLess(np.corrcoef(L, R)[0, 1], 0.95)
 
     def test_pitch(self):
         """A held A5 plays at 880 Hz (within 1 %)."""
@@ -253,6 +265,42 @@ class JunoVoiceTests(unittest.TestCase):
         fpk = np.fft.rfftfreq(8192, 1 / FS)[np.argmax(spec)]
         self.assertLess(abs(np.log2(fpk / MultiLadder.cutoff_hz(0.5))), 0.1)
 
+    def test_juno_fx_matches_model(self):
+        """JunoFx (HPF + chorus) gateware is bit-exact with FxModel: tones + noise,
+        all HPF positions and chorus modes (incl. off) switched during the run."""
+        rng = random.Random(3)
+        n = 1600
+        t = np.arange(n) / FS
+        x = (0.3 * np.sin(2 * np.pi * 110 * t) + 0.2 * np.sin(2 * np.pi * 1700 * t)
+             + 0.05 * np.array([rng.uniform(-1, 1) for _ in range(n)]))
+        xs = [int(v * 32768) for v in x]
+        modes = [((i // 200) % 4, (i // 400) % 4) for i in range(n)]   # (hpf, chorus)
+        m = Module()
+        m.submodules.dut = dut = JunoFx(PipelinedMAC())
+        got = []
+
+        async def testbench(ctx):
+            for v, (hpf, cho) in zip(xs, modes):
+                ctx.set(dut.hpf_mode, hpf)
+                ctx.set(dut.chorus_mode, cho)
+                await stream.put(ctx, dut.i, fixed.Const(v / 32768, shape=ASQ))
+                o = await stream.get(ctx, dut.o)
+                got.append((round(o[0].as_float() * 32768), round(o[1].as_float() * 32768)))
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+        model = FxModel()
+        expected = [model.sample(v, hpf, cho) for v, (hpf, cho) in zip(xs, modes)]
+        mismatches = [i for i, (a, b) in enumerate(zip(got, expected)) if a != b]
+        self.assertEqual(mismatches[:5], [], f"got {[got[i] for i in mismatches[:3]]}, "
+                         f"expected {[expected[i] for i in mismatches[:3]]}")
+        L, R = np.array(got).T
+        self.assertGreater(np.std(L), 1000)
+        self.assertGreater(np.mean(L[1200:] != R[1200:]), 0.9)   # chorus on: L != R
+
     def test_juno_lfo_matches_model(self):
         """JunoLfo gateware is bit-exact with JunoLfoModel: fast rate (several
         cycles), delay ramp restarted by a new note after all keys released,
@@ -300,11 +348,12 @@ class JunoVoiceTests(unittest.TestCase):
     def test_verilator_engine_matches_amaranth(self):
         """vl_render (Verilator) is bit-identical with the amaranth.sim render:
         staggered notes + note-offs, PWM by LFO, vibrato, filter LFO, Gate mode,
-        sub and noise."""
+        sub and noise, HPF bass boost, chorus I+II."""
         notes = [Note(0, 48, 0.0, 0.015), Note(1, 55, 0.003, 0.025), Note(2, 64, 0.008, 0.02)]
         p = Params(attack=8192, decay=4096, sustain=30000, release=4096, pulse=True,
                    pw=0.6, pwm_lfo=True, dco_lfo_semi=1.0, vcf_lfo=0.2,
-                   lfo_rate_hz=200.0, vca_gate=True, sub=0.5, noise=0.2)
+                   lfo_rate_hz=200.0, vca_gate=True, sub=0.5, noise=0.2,
+                   hpf=0, chorus=3)
         a = render_amaranth(notes, 0.025, p)
         b = vl_render.render_vl(notes, 0.025, p)
         self.assertEqual(np.abs(a - b).max(), 0.0)

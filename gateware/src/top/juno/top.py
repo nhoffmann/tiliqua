@@ -39,9 +39,9 @@ supported, selected on the MISC page).
       audio rate (filter cutoff 1V/oct, drive as a bipolar offset). Input 0 is
       unused for now (assignable CV inputs are planned).
 
-Each voice is hard panned left or right in the stereo field, with 2 end-of-chain
-effects: distortion and diffusion (delay), both of which can be mixed in with
-the UI.
+All 6 voices are summed to mono (Juno-style); the stereo image comes from the
+chorus. End of chain: 4-position HPF, BBD-style chorus (off / I / II / I+II),
+then distortion (drive).
 
     .. code-block:: text
 
@@ -49,21 +49,21 @@ the UI.
                  ─────┐ ┌─────  (`usb-host` setting)
                 ┌─────▼─▼─────┐
                 │Voice Tracker├──►┌─────────┐
-                └─────────────┘   │ Voices  │
-                                  │  (x6)   │
-                                  │         │
-                                  │ Wavetbl │
+                └─────────────┘   │ Voices  │ (x6, LFO: vibrato / PWM / VCF)
+                                  │   DCO   │ (saw / pulse / sub / noise)
                                   │    ▼    │
-                                  │  ADSR   │ (ADSR sets filter cutoff)
+                                  │ Ladder  │ (cutoff, reso, env, kbd)
                                   │    ▼    │
-                                  │ Ladder  │ (resonance =
-                                  └─────────┘  `reso` setting)
-                                  ┌────▼────┐
-                                  │Mix L/R  │
-                                  │(stereo) │
+                                  │   VCA   │ (ADSR or gate)
                                   └────┬────┘
-                                  ┌────▼────┐ (wet/dry mix =
-                                  │Diffuser │  `diffuse` setting)
+                                  ┌────▼────┐
+                                  │Mix mono │
+                                  └────┬────┘
+                                  ┌────▼────┐
+                                  │   HPF   │ (`hpf` setting)
+                                  └────┬────┘
+                                  ┌────▼────┐
+                                  │ Chorus  │ (`chorus` setting, mono -> stereo)
                                   └────┬────┘
                                   ┌────▼────┐
                                   │  Drive  │ (`drive` setting)
@@ -104,6 +104,7 @@ can also be used to control most of these through CCs as follows:
         VCF     env-pol       28  envelope polarity (+/-)
         VCF     kbd-track     29  keyboard tracking (0 = off, 1 = 100 %)
         VCF     lfo           34  LFO -> cutoff
+        VCF     hpf           36  HPF: bass boost / flat / 240 Hz / 720 Hz
 
         ADSR    attack        30  envelope attack (VCF + VCA)
         ADSR    decay         31  envelope decay
@@ -112,7 +113,7 @@ can also be used to control most of these through CCs as follows:
         ADSR    vca-mode      35  VCA follows envelope or gate
 
         EFFECT  drive         40  distortion amount
-        EFFECT  diffuse       41  diffusion wet/dry mix
+        EFFECT  chorus        41  chorus off / I / II / I+II (stereo from the mono voice sum)
 
         MISC    cc-highlight   -  highlight changed on CC input
         MISC    midi-ch        -  filter MIDI to specific channel (default: all)
@@ -152,41 +153,6 @@ from juno_voice import MultiADSR, PitchToInc
 from juno_core import JunoCore
 from juno_tracker import JunoVoiceState, JunoVoiceTracker
 
-class Diffuser(wiring.Component):
-
-    i: In(stream.Signature(data.ArrayLayout(ASQ, 4)))
-    o: Out(stream.Signature(data.ArrayLayout(ASQ, 4)))
-
-    def __init__(self):
-        super().__init__()
-
-        # 4 delay lines, backed by 4 independent SRAM banks.
-
-        self.delay_lines = [
-            dsp.DelayLine(max_delay=2048),
-            dsp.DelayLine(max_delay=4096),
-            dsp.DelayLine(max_delay=8192),
-            dsp.DelayLine(max_delay=8192),
-        ]
-
-        self.diffuser = dsp.delay_effect.Diffuser(self.delay_lines)
-
-        # Coefficients of this are tweaked by the SoC
-
-        self.matrix   = self.diffuser.matrix_mix
-
-    def elaborate(self, platform):
-        m = Module()
-
-        dsp.named_submodules(m.submodules, self.delay_lines)
-
-        m.submodules.diffuser = self.diffuser
-
-        wiring.connect(m, wiring.flipped(self.i), self.diffuser.i)
-        wiring.connect(m, self.diffuser.o, wiring.flipped(self.o))
-
-        return m
-
 class PolySynth(wiring.Component):
 
     N_VOICES = 6
@@ -212,8 +178,10 @@ class PolySynth(wiring.Component):
     sub_gain: In(unsigned(16))
     noise_gain: In(unsigned(16))
 
-    # VCA mode and LFO
+    # VCA mode, HPF / chorus and LFO
     vca_gate_mode: In(1)
+    hpf_mode: In(2)
+    chorus_mode: In(2)
     lfo_rate_inc: In(unsigned(32))
     lfo_delay_step: In(unsigned(32))
     lfo_dco_depth: In(unsigned(16))
@@ -303,31 +271,16 @@ class PolySynth(wiring.Component):
             voice_block.sub_gain.eq(self.sub_gain),
             voice_block.noise_gain.eq(self.noise_gain),
             voice_block.vca_gate_mode.eq(self.vca_gate_mode),
+            voice_block.hpf_mode.eq(self.hpf_mode),
+            voice_block.chorus_mode.eq(self.chorus_mode),
             voice_block.lfo_rate_inc.eq(self.lfo_rate_inc),
             voice_block.lfo_delay_step.eq(self.lfo_delay_step),
             voice_block.lfo_dco_depth.eq(self.lfo_dco_depth),
             voice_block.lfo_vcf_depth.eq(self.lfo_vcf_depth),
         ]
 
-        # Output diffuser
-
-        m.submodules.diffuser = diffuser = Diffuser()
-        self.diffuser = diffuser
-
-        # Voice stereo output -> expand to 4-ch for diffuser
-
-        m.submodules.vb_merge4 = vb_merge4 = dsp.Merge(n_channels=4, sink=diffuser.i)
-        vb_merge4.wire_valid(m, [0, 1])
-
+        # JunoCore stereo output (HPF + chorus inside) -> drive
         m.submodules.vb_split2 = vb_split2 = dsp.Split(n_channels=2, source=voice_block.o)
-        wiring.connect(m, vb_split2.o[0], vb_merge4.i[2])
-        wiring.connect(m, vb_split2.o[1], vb_merge4.i[3])
-
-        # Stereo distortion after diffuser
-
-        m.submodules.diffuser_split4 = diffuser_split4 = dsp.Split(
-                n_channels=4, source=diffuser.o)
-        diffuser_split4.wire_ready(m, [0, 1])
 
         def scaled_tanh(x):
             return math.tanh(3.0*x)
@@ -342,7 +295,7 @@ class PolySynth(wiring.Component):
             setattr(m.submodules, f"out_gainvca_{lr}", vca)
             setattr(m.submodules, f"out_waveshaper_{lr}", waveshaper)
 
-            dsp.connect_remap(m, diffuser_split4.o[2+lr], vca.i, lambda o, i : [
+            dsp.connect_remap(m, vb_split2.o[lr], vca.i, lambda o, i : [
                 i.payload[0].eq(o.payload<<2),
                 i.payload[1].eq(drive_val)
             ])
@@ -412,14 +365,10 @@ class SynthPeripheral(wiring.Component):
         note:   csr.Field(csr.action.R, unsigned(8))
         cutoff: csr.Field(csr.action.R, unsigned(8))
 
-    class Matrix(csr.Register, access="w"):
-        """Mixing matrix coefficient: commit on write strobe, MatrixBusy set until done."""
-        o_x:   csr.Field(csr.action.W, unsigned(4))
-        i_y:   csr.Field(csr.action.W, unsigned(4))
-        value: csr.Field(csr.action.W, signed(24))
-
-    class MatrixBusy(csr.Register, access="r"):
-        busy: csr.Field(csr.action.R, unsigned(1))
+    class Fx(csr.Register, access="w"):
+        """HPF position (0 bass boost, 1 flat, 2 240 Hz, 3 720 Hz), chorus (0 off, 1 I, 2 II, 3 I+II)."""
+        hpf:    csr.Field(csr.action.W, unsigned(2))
+        chorus: csr.Field(csr.action.W, unsigned(2))
 
     class MidiWrite(csr.Register, access="w"):
         msg: csr.Field(csr.action.W, unsigned(32))
@@ -449,8 +398,8 @@ class SynthPeripheral(wiring.Component):
         self._reso          = regs.add("reso",          self.Reso(),          offset=0x4)
         self._voices        = [regs.add(f"voices{i}",   self.Voice(),
                                offset=0x8+i*4) for i in range(PolySynth.N_VOICES)]
-        self._matrix        = regs.add("matrix",        self.Matrix(),        offset=voices_csr_end + 0x0)
-        self._matrix_busy   = regs.add("matrix_busy",   self.MatrixBusy(),    offset=voices_csr_end + 0x4)
+        # +0x0 / +0x4 were the Diffuser matrix registers (Diffuser replaced by JunoFx)
+        self._fx            = regs.add("fx",            self.Fx(),            offset=voices_csr_end + 0x0)
         self._midi_write    = regs.add("midi_write",    self.MidiWrite(),     offset=voices_csr_end + 0x8)
         self._midi_read     = regs.add("midi_read",     self.MidiRead(),      offset=voices_csr_end + 0xC)
         self._midi_host     = regs.add("usb_midi_host", self.UsbMidiHost(),   offset=voices_csr_end + 0x10)
@@ -548,22 +497,11 @@ class SynthPeripheral(wiring.Component):
                 voice.f.cutoff.r_data.eq(self.synth.voice_cutoffs[i])
             ]
 
-        # matrix coefficient update logic
-        matrix_busy = Signal()
-        m.d.comb += self._matrix_busy.f.busy.r_data.eq(matrix_busy)
-        with m.If(self._matrix.element.w_stb & ~matrix_busy):
+        # HPF / chorus
+        with m.If(self._fx.element.w_stb):
             m.d.sync += [
-                matrix_busy.eq(1),
-                self.synth.diffuser.matrix.c.payload.o_x         .eq(self._matrix.f.o_x.w_data),
-                self.synth.diffuser.matrix.c.payload.i_y         .eq(self._matrix.f.i_y.w_data),
-                self.synth.diffuser.matrix.c.payload.v.as_value().eq(self._matrix.f.value.w_data),
-                self.synth.diffuser.matrix.c.valid.eq(1),
-            ]
-        with m.If(matrix_busy & self.synth.diffuser.matrix.c.ready):
-            # coefficient has been written
-            m.d.sync += [
-                matrix_busy.eq(0),
-                self.synth.diffuser.matrix.c.valid.eq(0),
+                self.synth.hpf_mode.eq(self._fx.f.hpf.w_data),
+                self.synth.chorus_mode.eq(self._fx.f.chorus.w_data),
             ]
 
         m.submodules.midi_ch_filt = midi_ch_filt = midi.MidiChannelFilter()

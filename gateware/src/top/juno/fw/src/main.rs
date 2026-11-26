@@ -53,6 +53,28 @@ const PERSIST_HELP: u8 = 64;
 /// Bender -> VCF at full `bend-vcf`: 2 octaves (normalized octaves raw, 1 oct = 3276.8).
 const BEND_VCF_RANGE: i32 = 6554;
 
+/// Simulation only (`--features sim_pages`, used by `sim_ui.py`): the Verilator
+/// SoC harness has no encoder, so step to the next menu page every
+/// `SIM_PAGE_TICKS` and log it, one screenshot per page. Returns true on a change.
+#[cfg(feature = "sim_pages")]
+fn sim_step_pages(opts: &mut Opts) -> bool {
+    use portable_atomic::{AtomicU32, Ordering};
+    const SIM_PAGE_TICKS: u32 = 90; // 450 ms: previous page fades out; 9 pages fit the 5 s sim
+    static TICKS: AtomicU32 = AtomicU32::new(0);
+    let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if t % SIM_PAGE_TICKS != 0 {
+        return false;
+    }
+    let before = opts.page().value();
+    opts.page_mut().tick_up();
+    let after = opts.page().value();
+    if after == before {
+        return false;
+    }
+    info!("sim_pages: page {}", after.as_str());
+    true
+}
+
 fn tick_handler(app: &Mutex<RefCell<App>>) {
 
     critical_section::with(|cs| {
@@ -64,6 +86,10 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         //
 
         app.ui.update();
+        #[cfg(feature = "sim_pages")]
+        if sim_step_pages(&mut app.ui.opts) {
+            app.ui.external_modify();
+        }
         let opts = app.ui.opts.clone();
 
         //

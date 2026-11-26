@@ -689,7 +689,7 @@ class JunoSoc(TiliquaSoc):
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
         brief="Juno-style 6-voice MIDI synth (WIP)",
-        io_left=['', 'filter cv', 'drive cv', '', '', 'clk', 'out L', 'out R'],
+        io_left=['cv: pitch', 'cv: cutoff', 'cv', 'cv', 'cv: lfo', 'cv: env', 'out L', 'out R'],
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 

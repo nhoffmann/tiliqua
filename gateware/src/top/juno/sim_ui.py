@@ -4,13 +4,14 @@ Menu screenshots of the juno build without hardware: one PNG per menu page.
 
 Runs the upstream full-SoC Verilator simulation (``juno sim``: gateware + CPU +
 real firmware, video frames as BMP) with the firmware built with
-``--features sim_pages``, which steps to the next menu page every 450 ms (the
+``--features sim_pages``, which steps to the next menu page every 400 ms (the
 harness has no encoder) and logs ``sim_pages: page <name>`` on the UART. The last
-frame before each page change is saved as ``<nn>_<page>.png``.
+frame before each page change is saved as ``<nn>_<page>.png``, cropped to the
+menu block (``--full`` keeps the whole frame).
 
 Usage (from ``gateware/``, takes a few minutes; Verilator build ~2 min, ~1 frame/s)::
 
-    pdm run python -m top.juno.sim_ui [--out build/juno_ui] [--modeline 1280x720p60]
+    pdm run python -m top.juno.sim_ui [--out build/juno_ui] [--modeline 1280x720p60] [--full]
 
 Upstream ``tiliqua.build.sim`` is used unchanged; this script only wraps its
 subprocess calls at runtime:
@@ -21,7 +22,7 @@ subprocess calls at runtime:
   ``sim_pages`` firmware (``firmware_sim.bin``, built next to ``firmware.bin``).
 - the simulator binary: not run by ``sim.py``; started here under a pty
   (line-buffered UART log), stopped after the last page. The upstream harness
-  ends after 5 s simulated time (``sim_time``), so boot + 9 pages x 450 ms fit.
+  ends after 5 s simulated time (``sim_time``), so boot + 10 pages x 400 ms fit.
 """
 
 import argparse
@@ -41,12 +42,31 @@ LAST_PAGE = "MISC"          # page names as logged by the firmware
 FRAMES_LAST_PAGE = 24      # frames to wait on the last page before stopping
 TIMEOUT_S = 1800
 
+# Menu crop: the menu is a small block on an otherwise black frame. The previous
+# page is still fading out when a page is captured (400 ms per page); its pixels
+# are dimmer (green <= ~52) than the live menu text and drawings (green >= ~70).
+CROP_GREEN = 60
+CROP_FOOTER = 80            # bottom rows with the title / version line
+CROP_PAD = 16
+
+
+def crop_menu(im):
+    """Crop a frame to the live menu block (bounding box of bright pixels)."""
+    w, h = im.size
+    green = im.convert("RGB").getchannel("G").crop((0, 0, w, h - CROP_FOOTER))
+    box = green.point(lambda v: 255 if v > CROP_GREEN else 0).getbbox()
+    if box is None:
+        return im
+    x0, y0, x1, y1 = box
+    return im.crop((max(x0 - CROP_PAD, 0), max(y0 - CROP_PAD, 0),
+                    min(x1 + CROP_PAD, w), min(y1 + CROP_PAD, h)))
+
 
 def build_sim(modeline):
     """Run ``juno sim`` up to (not including) the simulator run. Returns the binary path."""
     import tiliqua.build.sim as tsim
     sys.path.insert(0, JUNO)    # top.py imports its sibling modules directly
-    from top.juno.top import JunoSoc
+    from top.juno.top import JunoSoc, archiver_callback
     from tiliqua.build.cli import top_level_cli
 
     real_check_call = subprocess.check_call
@@ -71,8 +91,7 @@ def build_sim(modeline):
     tsim.subprocess.check_call = check_call
     sys.argv = ["src/top/juno/top.py", "sim", "--hw", "r5", "--modeline", modeline]
     try:
-        top_level_cli(JunoSoc, path=JUNO,
-                      archiver_callback=lambda archiver: archiver.with_option_storage())
+        top_level_cli(JunoSoc, path=JUNO, archiver_callback=archiver_callback)
     except SystemExit as e:
         if e.code not in (0, None):
             raise
@@ -81,7 +100,7 @@ def build_sim(modeline):
     return state["binary"]
 
 
-def capture(binary, out):
+def capture(binary, out, full=False):
     from PIL import Image
 
     os.makedirs(out, exist_ok=True)
@@ -102,7 +121,8 @@ def capture(binary, out):
     def save(frame, name):
         idx = len(saved) + 1
         png = os.path.join(out, f"{idx:02d}_{name.lower()}.png")
-        Image.open(os.path.join(out, frame)).save(png)
+        im = Image.open(os.path.join(out, frame))
+        (im if full else crop_menu(im)).save(png)
         saved.append(png)
         print(f"sim_ui: {name:6s} <- {frame} -> {png}")
 
@@ -177,10 +197,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[1])
     parser.add_argument("--out", default="build/juno_ui")
     parser.add_argument("--modeline", default="1280x720p60")
+    parser.add_argument("--full", action="store_true", help="keep whole frames (no menu crop)")
     args = parser.parse_args()
     os.chdir(GATEWARE)
     binary = build_sim(args.modeline)
-    saved = capture(binary, os.path.abspath(args.out))
+    saved = capture(binary, os.path.abspath(args.out), args.full)
     print(f"sim_ui: {len(saved)} screenshots in {args.out}")
 
 

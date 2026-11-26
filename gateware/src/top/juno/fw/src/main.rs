@@ -41,6 +41,7 @@ use tiliqua_fw::cv;
 use tiliqua_hal::pmod::EurorackPmod;
 use tiliqua_fw::vcf;
 use tiliqua_fw::env;
+use tiliqua_fw::preset::{self, Action, PresetCtl, PresetStore};
 
 pub const TICK_PERIOD_MS: u32 = 5;
 
@@ -59,7 +60,7 @@ const BEND_VCF_RANGE: i32 = 6554;
 #[cfg(feature = "sim_pages")]
 fn sim_step_pages(opts: &mut Opts) -> bool {
     use portable_atomic::{AtomicU32, Ordering};
-    const SIM_PAGE_TICKS: u32 = 90; // 450 ms: previous page fades out; 9 pages fit the 5 s sim
+    const SIM_PAGE_TICKS: u32 = 80; // 400 ms: previous page fades out; 10 pages fit the 5 s sim
     static TICKS: AtomicU32 = AtomicU32::new(0);
     let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if t % SIM_PAGE_TICKS != 0 {
@@ -86,6 +87,7 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         //
 
         app.ui.update();
+        app.uptime_ms = app.uptime_ms.wrapping_add(TICK_PERIOD_MS);
         #[cfg(feature = "sim_pages")]
         if sim_step_pages(&mut app.ui.opts) {
             app.ui.external_modify();
@@ -124,6 +126,14 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
                 if let Some(action) = app.cc_mapper.process(cc.into(), val.into()) {
                     last_cc_index = Some(action.global_index);
                     apply_cc_action(&mut app.ui.opts, &action);
+                }
+            }
+            // Program change 0-31 -> preset A1..D8 (loaded by the main loop)
+            if let Ok(MidiMessage::ProgramChange(_, prog)) = MidiMessage::try_parse_slice(&bytes) {
+                let p: u8 = prog.into();
+                if p < preset::N_SLOTS {
+                    preset::set_location(&mut app.ui.opts, p);
+                    app.program_change = true;
                 }
             }
 
@@ -343,6 +353,10 @@ struct App {
     last_voice_knobs: Option<(bool, u16, u16, u8)>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
+    // time base for the main loop (preset write timeout, edit buffer autosave)
+    uptime_ms: u32,
+    // MIDI program change received (bank / patch already set in the options)
+    program_change: bool,
 }
 
 impl App {
@@ -367,6 +381,8 @@ impl App {
             last_voice_knobs: None,
             last_env_knobs: None,
             cc_mapper,
+            uptime_ms: 0,
+            program_change: false,
         }
     }
 }
@@ -399,9 +415,27 @@ fn main() -> ! {
     //
 
     let mut opts = Opts::default();
+    let default_patch_hash = preset::patch_hash(&opts);
     let flash = FlashMutex::<NoopRawMutex, _>::new(RefCell::new(spiflash));
+    // Option storage window: upstream system options first, presets behind (preset.rs)
+    let (system_window, preset_window) =
+        preset::split_window(bootinfo.manifest.get_option_storage_window());
     let mut flash_persist_opt = FlashOptionsPersistence::open_partition(
-        &flash, bootinfo.manifest.get_option_storage_window(), &mut opts);
+        &flash, system_window, &mut opts);
+    let mut preset_store = PresetStore::open_partition(&flash, preset_window);
+
+    // Restore the edit buffer (sound + active location as at power-off). Without
+    // one, keep the sound from the system save and mark it as `init` (edited).
+    let mut rec = [0u8; preset::BLOB_MAX + 8];
+    let (active, snap) = preset_store.as_mut()
+        .and_then(|s| s.load(preset::KEY_EDIT, &mut rec))
+        .and_then(|n| preset::decode_edit(&mut opts, &rec[..n]))
+        .unwrap_or((None, default_patch_hash));
+    if let Some(a) = active {
+        preset::set_location(&mut opts, a);
+    }
+    let mut preset_ctl = PresetCtl::new(preset::selected_slot(&opts), active, snap,
+                                        preset::patch_hash(&opts));
 
     //
     // Configure TUSB322 (CC controller) in DFP/Host mode
@@ -444,10 +478,15 @@ fn main() -> ! {
 
         loop {
 
-            let (opts, notes, cutoffs, draw_options, save_opts, wipe_opts) = critical_section::with(|cs| {
+            let (mut opts, notes, cutoffs, draw_options, save_opts, wipe_opts,
+                 preset_write, preset_init, program_change, now) = critical_section::with(|cs| {
                 let mut app = app.borrow_ref_mut(cs);
                 let save_opts = app.ui.opts.misc.save_opts.poll();
                 let wipe_opts = app.ui.opts.misc.wipe_opts.poll();
+                let preset_write = app.ui.opts.preset.write.poll();
+                let preset_init = app.ui.opts.preset.init.poll();
+                let program_change = core::mem::take(&mut app.program_change);
+                let now = app.uptime_ms;
 
                 // USB Host: Disable DFP terminations if `MISC->usb-host` option is off
                 //
@@ -504,7 +543,11 @@ fn main() -> ! {
                  app.synth.voice_cutoffs(),
                  app.ui.draw(),
                  save_opts,
-                 wipe_opts)
+                 wipe_opts,
+                 preset_write,
+                 preset_init,
+                 program_change,
+                 now)
             });
 
             if save_opts {
@@ -525,6 +568,74 @@ fn main() -> ! {
                         }
                     }
                 });
+            }
+
+            //
+            // Presets (preset.rs): load / write / init, edited marker, edit buffer
+            // autosave. Flash IO happens here, never in the tick ISR.
+            //
+
+            let sel = preset::selected_slot(&opts);
+            let on_preset_page = opts.tracker.page.value == Page::Preset;
+            // Loads / init are applied in place (no `Opts` copies: data and both
+            // stacks share 16 KiB block RAM), then mirrored into the local copy.
+            let apply = |ctl: &mut PresetCtl, rec: Option<&[u8]>, active: Option<u8>, opts: &mut Opts| -> bool {
+                let ok = critical_section::with(|cs| {
+                    let live = &mut app.borrow_ref_mut(cs).ui.opts;
+                    let ok = rec.map(|r| preset::decode(live, r)).unwrap_or(false);
+                    if !ok {
+                        preset::reset(live);
+                    }
+                    preset::copy_patch(opts, live);
+                    ok
+                });
+                ctl.loaded(active, preset::patch_hash(opts), active.is_some() && !ok);
+                ok
+            };
+            match preset_ctl.step(now, sel, on_preset_page, preset_write, preset_init, program_change) {
+                Action::Load(slot) => {
+                    let n = preset_store.as_mut().and_then(|s| s.load(slot as u32, &mut rec));
+                    let ok = apply(&mut preset_ctl, n.map(|n| &rec[..n]), Some(slot), &mut opts);
+                    info!("preset: load {}{}", preset::slot_name(slot), if ok { "" } else { " (empty)" });
+                }
+                Action::Init => {
+                    apply(&mut preset_ctl, None, None, &mut opts);
+                }
+                Action::Write(slot) => {
+                    let ok = match (preset_store.as_mut(), preset::encode(&opts, &mut rec)) {
+                        (Some(s), Some(n)) => s.save(slot as u32, &rec[..n]),
+                        _ => false,
+                    };
+                    if ok {
+                        preset_ctl.loaded(Some(slot), preset::patch_hash(&opts), false);
+                        info!("preset: wrote {}", preset::slot_name(slot));
+                    } else {
+                        error!("preset: write {} failed", preset::slot_name(slot));
+                    }
+                }
+                Action::Revert(slot) => {
+                    critical_section::with(|cs| {
+                        preset::set_location(&mut app.borrow_ref_mut(cs).ui.opts, slot);
+                    });
+                    preset::set_location(&mut opts, slot);
+                }
+                Action::None => {}
+            }
+            let patch_hash = preset::patch_hash(&opts);
+            let status = preset_ctl.status(preset::selected_slot(&opts), patch_hash);
+            if status != opts.preset.status.value {
+                opts.preset.status.value = status.clone();
+                critical_section::with(|cs| {
+                    app.borrow_ref_mut(cs).ui.opts.preset.status.value = status;
+                });
+            }
+            if preset_ctl.autosave_due(now, patch_hash) {
+                if let Some(s) = preset_store.as_mut() {
+                    if let Some(n) = preset::encode_edit(&opts, preset_ctl.active, preset_ctl.snap(), &mut rec) {
+                        s.save(preset::KEY_EDIT, &rec[..n]);
+                    }
+                }
+                preset_ctl.autosaved(patch_hash);   // also on failure: no retry storm
             }
 
             let on_help_page = opts.tracker.page.value == Page::Help;

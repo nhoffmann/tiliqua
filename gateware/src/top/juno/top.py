@@ -88,6 +88,12 @@ can also be used to control most of these through CCs as follows:
         ────    ─────────     ──  ───────────
         HELP    scroll         -  scroll help text up/down
 
+        PRESET  bank           -  A..D (selecting bank / patch loads it)
+        PRESET  patch          -  1..8 (MIDI program change 0-31 = A1..D8)
+        PRESET  status         -  active preset, `*` = edited since load
+        PRESET  write          -  press twice: store the sound (pick target in between)
+        PRESET  init           -  load the default sound
+
         VOICE   assign        14  poly / unison (all voices, last note, legato)
         VOICE   porta          5  portamento (per-voice glide, 0 = off .. 3 s)
         VOICE   detune        94  unison spread (0 .. +-25 cents)
@@ -130,12 +136,16 @@ can also be used to control most of these through CCs as follows:
         MISC    midi-ch        -  filter MIDI to specific channel (default: all)
         MISC    usb-host       -  enable USB host MIDI (disables TRS)
         MISC    serial-debug   -  dump MIDI data out serial port
-        MISC    save-opts      -  save all options to flash
-        MISC    wipe-opts      -  reset all options to defaults
+        MISC    save-opts      -  save the system options (CV, MISC) to flash
+        MISC    wipe-opts      -  reset all options to defaults (keeps presets)
 
     MIDI CC 1 (mod wheel) adds vibrato (Juno-106 LFO lever, VOICE `wheel`
     sensitivity). Pitch bend: range 0..12 semitones (VOICE `bend`), optionally
     also to the filter (VOICE `bend-vcf`). CC 64 (sustain pedal) holds voices.
+
+    Presets store the VOICE, LFO, DCO, VCF, ENV and FX pages. The current
+    sound (edit buffer) and preset location are saved automatically 2 s after
+    the last change and restored at power-on.
 
 """
 
@@ -775,6 +785,15 @@ class JunoSoc(TiliquaSoc):
         return m
 
 
+# Option storage: 8 KiB upstream system options (unchanged position) + 56 KiB
+# presets (fw preset.rs, SYSTEM_SIZE), inside the slot's 128 KiB option area.
+OPTION_STORAGE_SIZE = 0x10000
+
+
+def archiver_callback(archiver):
+    archiver.with_option_storage(size=OPTION_STORAGE_SIZE)
+
+
 if __name__ == "__main__":
     this_path = os.path.dirname(os.path.realpath(__file__))
-    top_level_cli(JunoSoc, path=this_path, archiver_callback=lambda archiver: archiver.with_option_storage())
+    top_level_cli(JunoSoc, path=this_path, archiver_callback=archiver_callback)

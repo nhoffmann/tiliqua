@@ -7,6 +7,7 @@ use serde_derive::{Serialize, Deserialize};
 pub enum Page {
     #[default]
     Help,
+    Preset,
     Voice,
     Lfo,
     Dco,
@@ -179,6 +180,31 @@ impl MidiChannel {
     }
 }
 
+// Preset location, Juno-style: bank A-D x patch 1-8 (preset.rs).
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+pub enum Bank {
+    #[default]
+    #[strum(serialize = "A")] A = 0,
+    #[strum(serialize = "B")] B = 1,
+    #[strum(serialize = "C")] C = 2,
+    #[strum(serialize = "D")] D = 3,
+}
+
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+pub enum PatchNum {
+    #[default]
+    #[strum(serialize = "1")] P1 = 0,
+    #[strum(serialize = "2")] P2 = 1,
+    #[strum(serialize = "3")] P3 = 2,
+    #[strum(serialize = "4")] P4 = 3,
+    #[strum(serialize = "5")] P5 = 4,
+    #[strum(serialize = "6")] P6 = 5,
+    #[strum(serialize = "7")] P7 = 6,
+    #[strum(serialize = "8")] P8 = 7,
+}
+
 int_params!(PageNumParams<u16>    { step: 1, min: 0, max: 0 });
 int_params!(BendParams<u16>       { step: 1, min: 0, max: 12 });
 int_params!(CvAmtParams<i16>      { step: 512, min: -16384, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
@@ -200,6 +226,26 @@ button_params!(OneShotButtonParams { mode: ButtonMode::OneShot });
 pub struct HelpOpts {
     #[option(0)]
     pub scroll: IntOption<ScrollParams>,
+}
+
+// Presets (Phase 6, preset.rs): 32 slots A1..D8. Turning bank / patch loads the
+// slot immediately (Juno-106 style; MIDI program change 0-31 does the same).
+// `write` stores the current sound: first press arms it (`status` shows the
+// target, bank / patch now pick the target without loading), second press
+// writes. `init` loads the default sound. `status`: active location, `*` when
+// edited since load / write.
+#[derive(OptionPage, Clone)]
+pub struct PresetOpts {
+    #[option]
+    pub bank: EnumOption<Bank>,
+    #[option]
+    pub patch: EnumOption<PatchNum>,
+    #[option("init")]
+    pub status: StringOption,
+    #[option(false)]
+    pub write: ButtonOption<OneShotButtonParams>,
+    #[option(false)]
+    pub init: ButtonOption<OneShotButtonParams>,
 }
 
 // Voice / keyboard controls (Juno-106 left-hand panel): key assign (poly /
@@ -354,6 +400,8 @@ pub struct Opts {
     pub tracker: ScreenTracker<Page>,
     #[page(Page::Help)]
     pub help: HelpOpts,
+    #[page(Page::Preset)]
+    pub preset: PresetOpts,
     #[page(Page::Voice)]
     pub voice: VoiceOpts,
     #[page(Page::Lfo)]

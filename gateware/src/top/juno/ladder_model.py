@@ -27,7 +27,7 @@ ONE = 1 << 15
 SAT = (1 << 17) - 1            # 18-bit signed MAC operand range
 FS = 48000
 N_OVERSAMPLE = 2
-CUTOFF_F_MIN = 12.0
+CUTOFF_F_MIN = 20.0           # 20 Hz .. 20.5 kHz over 10 octaves (Phase 4.1; was 12 Hz .. 12.2 kHz)
 CUTOFF_OCTAVES = 10
 CUTOFF_LUT_BITS = 10
 TANH_LUT_BITS = 10             # over |u| in [0, 4)
@@ -49,6 +49,25 @@ OUT_SHIFT = 0
 # self-oscillation only at the very top. Applied by the firmware (fw/src/vcf.rs)
 # and by sim_render.prepare(); the gateware takes the register value.
 RES_CURVE = [0.0, 0.19, 0.375, 0.4625, 0.55, 0.62, 0.715, 0.825, 0.95]
+
+
+# Cutoff knob (0..32768) -> cutoff c (normalized octaves, 15 bit), behaving like
+# the Juno-106 VCF FREQ slider (knob = slider / 127). The KR-106 measurement
+# (tools/kr106_compare.py) is linear in octaves: c = 0.011079 (slider - 16), i.e.
+# c = 1.40703 knob - 0.17726. Not clamped here: env / kbd / mod are added first,
+# the gateware clamps the sum. Same formula in firmware fw/src/vcf.rs.
+CUT_KNOB_SCALE = 46106          # 1.40703 * 2**15
+CUT_KNOB_OFFSET = 5809          # 0.17726 * 2**15
+
+
+def cutoff_knob_to_c(knob_raw):
+    """Cutoff knob 0..32768 -> c raw (15 bit, may be < 0 or > 1.0)."""
+    return ((knob_raw * CUT_KNOB_SCALE) >> 15) - CUT_KNOB_OFFSET
+
+
+# Keyboard tracking reference: C1 (MIDI 24, 32.703 Hz), as the KR-106 formula
+# log(noteFreq / 32.703) * kbd.
+KBD_REF_NOTE = 24
 
 
 def res_knob_to_reg(knob):

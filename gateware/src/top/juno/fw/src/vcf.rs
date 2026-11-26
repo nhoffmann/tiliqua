@@ -1,5 +1,16 @@
 //! Juno VCF helpers: knob (0..32768) -> `MultiLadder` register values.
 
+/// Cutoff knob -> cutoff c (normalized octaves, 32768 = 1.0 = 10 octaves above
+/// 20 Hz), like the Juno-106 VCF FREQ slider (knob = slider / 127), measured on
+/// the KR-106: c = 1.40703 knob - 0.17726. Not clamped: env / kbd / mod are added
+/// first. Same formula as `ladder_model.cutoff_knob_to_c` (sim_render).
+pub fn cutoff_knob_to_c(knob: u16) -> i32 {
+    ((i32::from(knob) * 46106) >> 15) - 5809
+}
+
+/// Keyboard tracking reference note: C1 (MIDI 24), as the KR-106.
+pub const KBD_REF_NOTE: i32 = 24;
+
 /// Resonance knob -> `reso` register (0..32768, gateware k = 4.5 * reso).
 /// Piecewise linear at knob = 0, 1/8, ..., 1; calibrated against the KR-106
 /// (Juno-106 RES slider). Same table as `ladder_model.RES_CURVE` (sim_render).

@@ -49,8 +49,10 @@ from tiliqua.dsp.block import Block, BlockMerge
 # top.py runs as a script (sibling imports); tests / sim_render import the package.
 try:
     import ladder_model as LM
+    import adsr_model as AM
 except ImportError:
     from top.juno import ladder_model as LM
+    from top.juno import adsr_model as AM
 
 
 class PipelinedMAC(mac.MAC):
@@ -509,12 +511,16 @@ class MultiJunoOsc(wiring.Component):
 
 class MultiADSR(wiring.Component):
     """
-    N ADSR envelope generators with:
-    - Independent gate/velocity per voice (output is velocity * adsr product)
-    - Global attack/decay/sustain/release control
-    - Outgoing bitfield of which voices are still traversing through ADSR states
-      (e.g. gate released, but voice is still releasing - used for culling)
+    N Juno-106-style envelope generators (Juno port, Phase 4.2), bit-exact with
+    ``top.juno.adsr_model.AdsrModel`` (see there for the algorithm):
 
+    - 32-bit level per voice; linear attack (32-bit increment);
+    - exponential decay toward 0 that stops at the sustain level, exponential
+      release, both ``L -= ((L >> 15) * eps) >> 4`` with ``eps`` (17 bit, 19
+      fractional bits) from firmware; voice goes idle below ~-96 dB;
+    - output ``velocity * level`` (UQ(0,16)), outgoing bitfield of active voices.
+
+    One ``PipelinedMAC`` (decay/release step and velocity scaling).
     Free-running: sample rate is determined by backpressure on ``self.o``.
     """
 
@@ -533,11 +539,11 @@ class MultiADSR(wiring.Component):
             # Gate and velocity inputs (independent per-voice)
             "voice_gates":    In(data.ArrayLayout(unsigned(1), n)),
             "voice_velocity": In(data.ArrayLayout(self.EnvUQ, n)),
-            # Global ADSR rates
-            "attack_rate":    In(self.EnvUQ),
-            "decay_rate":     In(self.EnvUQ),
+            # Global envelope settings (see adsr_model)
+            "attack_rate":    In(unsigned(32)),   # level increment per sample
+            "decay_rate":     In(unsigned(17)),   # eps, 19 fractional bits
             "sustain_level":  In(self.EnvUQ),
-            "release_rate":   In(self.EnvUQ),
+            "release_rate":   In(unsigned(17)),   # eps, 19 fractional bits
             # Samples out and bitfield of active voices
             "o": Out(stream.Signature(Block(self.EnvUQ))),
             "voice_active": Out(data.ArrayLayout(unsigned(1), n)),
@@ -546,133 +552,128 @@ class MultiADSR(wiring.Component):
     def elaborate(self, platform):
         m = Module()
         N = self.n
-        EnvUQ = self.EnvUQ
+        L_MAX = AM.L_MAX
+        m.submodules.macp = mp = PipelinedMAC()
 
-        # Per-voice ADSR state memory
-
-        adsr_state_layout = data.StructLayout({
-            "l_gate":     unsigned(1),
-            "adsr_phase": self.Phase,
-            "adsr_level": EnvUQ,
+        state_layout = data.StructLayout({
+            "l_gate": unsigned(1),
+            "phase":  self.Phase,
+            "level":  unsigned(32),
         })
-        m.submodules.state_mem = state_mem = Memory(
-            shape=adsr_state_layout, depth=N, init=[])
+        m.submodules.state_mem = state_mem = Memory(shape=state_layout, depth=N, init=[])
         st_rport = state_mem.read_port()
         st_wport = state_mem.write_port()
         m.d.comb += st_rport.en.eq(1)
 
-        # Registers fetched / stored from above state mem
+        voice_ix = Signal(range(N))
+        l_gate   = Signal()
+        phase    = Signal(self.Phase)
+        level    = Signal(32)
+        cur_gate = Signal()
+        cur_vel  = Signal(16)
+        out      = Signal(16)
 
-        l_gate      = Signal(1)
-        adsr_phase  = Signal(self.Phase)
-        adsr_level  = Signal(EnvUQ)
-        cur_gate    = Signal(1)
-        cur_vel_mod = Signal(EnvUQ)
-        voice_ix    = Signal(range(N))
+        mac_a = Signal(mac.SQNative)
+        mac_b = Signal(mac.SQNative)
+        prod  = Signal(36)
+        m.d.comb += prod.eq(mp.result.z.as_value())   # raw integer product
+
+        sus32 = Signal(32)
+        m.d.comb += sus32.eq(self.sustain_level.as_value() << 16)
 
         with m.FSM():
 
             with m.State('LOAD'):
                 m.d.comb += st_rport.addr.eq(voice_ix)
-                m.next = 'LATCH-STATE'
+                m.next = 'LATCH'
 
-            with m.State('LATCH-STATE'):
+            with m.State('LATCH'):
                 m.d.sync += [
                     l_gate.eq(st_rport.data.l_gate),
-                    adsr_phase.eq(st_rport.data.adsr_phase),
-                    adsr_level.eq(st_rport.data.adsr_level),
+                    phase.eq(st_rport.data.phase),
+                    level.eq(st_rport.data.level),
                 ]
                 with m.Switch(voice_ix):
                     for n in range(N):
                         with m.Case(n):
-                            # Latch gate, vel for current voice
                             m.d.sync += [
                                 cur_gate.eq(self.voice_gates[n]),
-                                cur_vel_mod.eq(self.voice_velocity[n]),
+                                cur_vel.eq(self.voice_velocity[n].as_value()),
                             ]
-                m.next = 'ADSR-UPDATE'
+                m.next = 'GATE'
 
-            with m.State('ADSR-UPDATE'):
+            with m.State('GATE'):
+                with m.If(cur_gate & ~l_gate):
+                    m.d.sync += phase.eq(self.Phase.ATTACK)
+                with m.Elif(~cur_gate & l_gate):
+                    m.d.sync += phase.eq(self.Phase.RELEASE)
+                m.d.sync += l_gate.eq(cur_gate)
+                m.next = 'UPDATE'
 
-                gate_rising  = Signal()
-                gate_falling = Signal()
-                m.d.comb += [
-                    gate_rising.eq(cur_gate & ~l_gate),
-                    gate_falling.eq(~cur_gate & l_gate),
-                ]
-
-                active_phase = Signal(self.Phase)
-                m.d.comb += active_phase.eq(adsr_phase)
-                with m.If(gate_rising):
-                    m.d.comb += active_phase.eq(self.Phase.ATTACK)
-                with m.Elif(gate_falling):
-                    m.d.comb += active_phase.eq(self.Phase.RELEASE)
-
-                next_level = Signal(EnvUQ)
-                out_phase = Signal(self.Phase)
-                m.d.comb += [
-                    next_level.eq(adsr_level),
-                    out_phase.eq(active_phase),
-                ]
-
-                with m.Switch(active_phase):
+            with m.State('UPDATE'):
+                with m.Switch(phase):
                     with m.Case(self.Phase.IDLE):
-                        m.d.comb += next_level.eq(0)
+                        m.d.sync += level.eq(0)
+                        m.next = 'VEL'
                     with m.Case(self.Phase.ATTACK):
-                        attack_sum = adsr_level + self.attack_rate
-                        with m.If(attack_sum >= EnvUQ.max()):
-                            m.d.comb += [
-                                next_level.eq(EnvUQ.max()),
-                                out_phase.eq(self.Phase.DECAY),
-                            ]
+                        nxt = Signal(33)
+                        m.d.comb += nxt.eq(level + self.attack_rate)
+                        with m.If(nxt >= L_MAX):
+                            m.d.sync += [level.eq(L_MAX), phase.eq(self.Phase.DECAY)]
                         with m.Else():
-                            m.d.comb += next_level.eq(attack_sum)
-                    with m.Case(self.Phase.DECAY):
-                        with m.If(adsr_level <= self.sustain_level + self.decay_rate):
-                            m.d.comb += [
-                                next_level.eq(self.sustain_level),
-                                out_phase.eq(self.Phase.SUSTAIN),
-                            ]
-                        with m.Else():
-                            m.d.comb += next_level.eq(adsr_level - self.decay_rate)
+                            m.d.sync += level.eq(nxt)
+                        m.next = 'VEL'
                     with m.Case(self.Phase.SUSTAIN):
-                        m.d.comb += next_level.eq(self.sustain_level)
-                    with m.Case(self.Phase.RELEASE):
-                        with m.If(adsr_level <= self.release_rate):
-                            m.d.comb += [
-                                next_level.eq(0),
-                                out_phase.eq(self.Phase.IDLE),
-                            ]
-                        with m.Else():
-                            m.d.comb += next_level.eq(adsr_level - self.release_rate)
+                        m.d.sync += level.eq(sus32)
+                        m.next = 'VEL'
+                    with m.Case(self.Phase.DECAY, self.Phase.RELEASE):
+                        m.next = 'EXP'
 
-                m.d.sync += [
-                    adsr_level.eq(next_level),
-                    adsr_phase.eq(out_phase),
-                    l_gate.eq(cur_gate),
-                ]
-                m.next = 'STORE'
+            with m.State('EXP'):
+                # L -= ((L >> 15) * eps) >> (EPS_FRAC - 15)
+                eps = Mux(phase == self.Phase.DECAY, self.decay_rate, self.release_rate)
+                m.d.comb += [mac_a.as_value().eq(level >> 15), mac_b.as_value().eq(eps)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    nl = Signal(33)
+                    m.d.comb += nl.eq(level - (prod >> (AM.EPS_FRAC - 15)))
+                    with m.If(phase == self.Phase.DECAY):
+                        with m.If(nl <= sus32):
+                            m.d.sync += [level.eq(sus32), phase.eq(self.Phase.SUSTAIN)]
+                        with m.Else():
+                            m.d.sync += level.eq(nl)
+                    with m.Else():
+                        with m.If(nl < AM.L_SILENT):
+                            m.d.sync += [level.eq(0), phase.eq(self.Phase.IDLE)]
+                        with m.Else():
+                            m.d.sync += level.eq(nl)
+                    m.next = 'VEL'
+
+            with m.State('VEL'):
+                # out = ((L >> 16) * velocity) >> 16
+                m.d.comb += [mac_a.as_value().eq(level >> 16), mac_b.as_value().eq(cur_vel)]
+                with mp.Multiply(m, a=mac_a, b=mac_b):
+                    m.d.sync += out.eq(prod >> 16)
+                    m.next = 'STORE'
 
             with m.State('STORE'):
                 m.d.comb += [
                     st_wport.addr.eq(voice_ix),
                     st_wport.data.l_gate.eq(l_gate),
-                    st_wport.data.adsr_phase.eq(adsr_phase),
-                    st_wport.data.adsr_level.eq(adsr_level),
+                    st_wport.data.phase.eq(phase),
+                    st_wport.data.level.eq(level),
                     st_wport.en.eq(1),
                 ]
                 with m.Switch(voice_ix):
                     for n in range(N):
                         with m.Case(n):
-                            m.d.sync += self.voice_active[n].eq(
-                                adsr_phase != self.Phase.IDLE)
+                            m.d.sync += self.voice_active[n].eq(phase != self.Phase.IDLE)
                 m.next = 'EMIT'
 
             with m.State('EMIT'):
                 m.d.comb += [
                     self.o.valid.eq(1),
                     self.o.payload.first.eq(voice_ix == 0),
-                    self.o.payload.sample.eq(adsr_level * cur_vel_mod),
+                    self.o.payload.sample.as_value().eq(out),
                 ]
                 with m.If(self.o.ready):
                     with m.If(voice_ix == N - 1):
@@ -1091,10 +1092,10 @@ class JunoVoice(wiring.Component):
             # LFO -> cutoff (normalized octaves) and VCA Gate mode
             "cutoff_mod":     In(ASQ),
             "vca_gate_mode":  In(1),
-            "attack_rate":    In(MultiADSR.EnvUQ),
-            "decay_rate":     In(MultiADSR.EnvUQ),
+            "attack_rate":    In(unsigned(32)),
+            "decay_rate":     In(unsigned(17)),
             "sustain_level":  In(MultiADSR.EnvUQ),
-            "release_rate":   In(MultiADSR.EnvUQ),
+            "release_rate":   In(unsigned(17)),
 
             # Juno DCO mixer (global, see MultiJunoOsc)
             "saw_en":         In(1),

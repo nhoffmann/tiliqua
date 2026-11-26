@@ -33,24 +33,21 @@ from tiliqua.test import stream
 from top.juno.juno_core import JunoCore
 from top.juno.juno_lfo import pw_knob_to_point
 from top.juno.juno_voice import MultiADSR, MultiLadder, PitchToInc
-from top.juno.ladder_model import res_knob_to_reg
+from top.juno.ladder_model import KBD_REF_NOTE, res_knob_to_reg
+from top.juno.adsr_model import attack_inc_for_time, eps_for_time
 
 FS = 48000
 N_VOICES = 6
 EnvUQ = MultiADSR.EnvUQ
 
 
-def adsr_ui_to_rate(ui_value):
-    """Same mapping as the firmware (main.rs): UI 0..32768 -> 1 ms..2000 ms."""
-    ms_x32k = 32768 + ui_value * 1999
-    return min(45_000_000 // ms_x32k, 65535)
-
-
 def cutoff_base(cutoff, kbd, note, mod_wheel=0.0):
     """Per-voice cutoff base, same formula as the firmware (normalized octaves):
-    knob + keyboard tracking relative to C4 (note 60) + mod wheel offset."""
+    cutoff + keyboard tracking relative to C1 (note 24, KR-106) + mod wheel offset.
+    ``cutoff`` is the internal c (0..1 = 20 Hz .. 20.5 kHz); the firmware gets it
+    from the knob via ``ladder_model.cutoff_knob_to_c`` (Juno-106 slider curve)."""
     octave = 1.0 / MultiLadder.CUTOFF_OCTAVES
-    return cutoff + kbd * (note - 60) / 12 * octave + mod_wheel * MOD_WHEEL_RANGE
+    return cutoff + kbd * (note - KBD_REF_NOTE) / 12 * octave + mod_wheel * MOD_WHEEL_RANGE
 
 
 # Mod wheel fully up opens the cutoff by this much (normalized octaves).
@@ -69,10 +66,12 @@ class Note:
 @dataclass
 class Params:
     """Global synth params in hardware units. Defaults = firmware option defaults."""
-    attack:  int = adsr_ui_to_rate(0)
-    decay:   int = adsr_ui_to_rate(4096)
-    sustain: int = 16384 * 65535 // 32768
-    release: int = adsr_ui_to_rate(4096)
+    # Envelope (Juno-106 style, Phase 4.2): attack = seconds to full level,
+    # decay / release = seconds to -60 dB, sustain 0..1
+    attack:  float = 0.001
+    decay:   float = 0.3
+    sustain: float = 0.5
+    release: float = 0.3
     res:     float = 0.5      # ladder resonance knob 0..1 (k = 4.5 res; firmware default 0.5)
     # Exponential cutoff (normalized octaves, see MultiLadder); firmware defaults
     cutoff:  float = 0.35
@@ -127,10 +126,10 @@ def prepare(notes, seconds, params=None):
         "lfo_vcf_depth":  round(params.vcf_lfo * 32768),
         "sub_gain":       round(0.67 * params.sub * 65535),
         "noise_gain":     round(params.noise * 65535),
-        "attack_rate":    params.attack,
-        "decay_rate":     params.decay,
-        "sustain_level":  params.sustain,
-        "release_rate":   params.release,
+        "attack_rate":    attack_inc_for_time(max(params.attack, 1 / FS)),
+        "decay_rate":     eps_for_time(max(params.decay, 1 / FS)),
+        "sustain_level":  min(65535, round(params.sustain * 65536)),
+        "release_rate":   eps_for_time(max(params.release, 1 / FS)),
         "reso":           res_knob_to_reg(params.res),   # KR-106-calibrated curve
         "env_amt":        _raw(params.env_amt, ASQ),
         "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
@@ -206,14 +205,13 @@ SCENES = {
     # plucky bass: dark filter, strong env amount, zero sustain
     "pluck_bass": (lambda s: [Note(v % 2, n, i * s / 4, i * s / 4 + s / 5)
                               for i, (v, n) in enumerate(zip(range(4), [36, 36, 43, 39]))],
-                   Params(cutoff=0.2, env_amt=0.7, kbd=0.3, sustain=0,
-                          decay=adsr_ui_to_rate(2500), release=adsr_ui_to_rate(1500))),
+                   Params(cutoff=0.2, env_amt=0.7, kbd=0.3, sustain=0.0,
+                          decay=0.4, release=0.25)),
     # slow attack brassy swell: filter opens with the envelope
     "brass_swell": (lambda s: [Note(0, 48, 0.0, s * 0.7), Note(1, 55, 0.0, s * 0.7),
                                Note(2, 60, 0.0, s * 0.7)],
                     Params(cutoff=0.3, env_amt=0.55, kbd=0.5,
-                           attack=adsr_ui_to_rate(4000), decay=adsr_ui_to_rate(6000),
-                           sustain=45000, release=adsr_ui_to_rate(3000))),
+                           attack=0.25, decay=1.2, sustain=0.7, release=0.5)),
     # Juno DCO mixer: same phrase with saw, square, narrow pulse, saw+pulse
     "dco_saw":    (lambda s: [Note(0, 48, 0.0, s * 0.8)], Params(cutoff=0.6, env_amt=0.2)),
     "dco_square": (lambda s: [Note(0, 48, 0.0, s * 0.8)],
@@ -242,20 +240,19 @@ SCENES = {
                            lfo_rate_hz=3.0)),
     "vca_gate":    (lambda s: [Note(v, 48 + 3 * v, v * s / 6, v * s / 6 + s / 10)
                                for v in range(N_VOICES)],
-                    Params(vca_gate=True, cutoff=0.3, env_amt=0.5, sustain=0,
-                           decay=adsr_ui_to_rate(3000))),
+                    Params(vca_gate=True, cutoff=0.3, env_amt=0.5, sustain=0.0,
+                           decay=0.5)),
     # ladder: resonant envelope sweep, and self-oscillation ringing
     "ladder_sweep": (lambda s: [Note(0, 36, 0.0, s * 0.45), Note(1, 43, s * 0.5, s * 0.95)],
-                     Params(cutoff=0.15, env_amt=0.75, res=0.85, sustain=8000,
-                            decay=adsr_ui_to_rate(5000), release=adsr_ui_to_rate(3000))),
+                     Params(cutoff=0.15, env_amt=0.75, res=0.85, sustain=0.12,
+                            decay=0.8, release=0.5)),
     "ladder_selfosc": (lambda s: [Note(0, 60, 0.0, s * 0.8)],
                        Params(cutoff=0.6, env_amt=0.0, kbd=1.0, res=1.0, saw=True)),
     # Phase 3: chorus modes and HPF positions on a pad chord
     **{f"chorus_{name}": (lambda s: [Note(0, 48, 0.0, s * 0.85), Note(1, 55, 0.0, s * 0.85),
                                      Note(2, 60, 0.0, s * 0.85), Note(3, 64, 0.0, s * 0.85)],
                           Params(cutoff=0.65, env_amt=0.15, res=0.2, chorus=mode,
-                                 attack=adsr_ui_to_rate(1500), sustain=50000,
-                                 release=adsr_ui_to_rate(3000)))
+                                 attack=0.1, sustain=0.75, release=0.5))
        for name, mode in (("off", 0), ("I", 1), ("II", 2), ("I_II", 3))},
     **{f"hpf_{pos}": (lambda s: [Note(0, 36, 0.0, s * 0.85)],
                       Params(cutoff=0.8, env_amt=0.0, saw=True, sub=0.6, hpf=pos))

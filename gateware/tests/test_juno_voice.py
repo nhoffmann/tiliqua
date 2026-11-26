@@ -25,6 +25,7 @@ from top.juno.juno_lfo import JunoLfo, JunoLfoModel
 from top.juno.osc_model import OscModel
 from top.juno.ladder_model import LadderModel
 from top.juno.fx_model import FxModel
+from top.juno.adsr_model import AdsrModel, attack_inc_for_time, eps_for_time
 from top.juno.juno_fx import JunoFx
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
@@ -86,7 +87,7 @@ class JunoVoiceTests(unittest.TestCase):
 
     def test_chorus_makes_stereo(self):
         """Chorus I widens the mono sum: left and right differ, similar level."""
-        p = Params(attack=8192, decay=8192, sustain=65535, release=2048, chorus=1)
+        p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001, chorus=1)
         out = render([Note(0, 60, 0.0, 1.0), Note(1, 64, 0.0, 1.0)], seconds=0.2, params=p)
         L, R = out[FS // 20:, 0], out[FS // 20:, 1]
         self.assertGreater(np.mean(L != R), 0.9)
@@ -301,6 +302,65 @@ class JunoVoiceTests(unittest.TestCase):
         self.assertGreater(np.std(L), 1000)
         self.assertGreater(np.mean(L[1200:] != R[1200:]), 0.9)   # chorus on: L != R
 
+    def test_adsr_matches_model(self):
+        """MultiADSR (Juno-106 style) gateware is bit-exact with AdsrModel: attack,
+        decay to sustain, sustain, release to idle, release during attack,
+        retrigger during release; 3 voices with different gates and velocities."""
+        n_voices, n_frames = 3, 1500
+        cfg = dict(attack_inc=attack_inc_for_time(0.002), decay_eps=eps_for_time(0.004),
+                   sustain=26000, release_eps=eps_for_time(0.006))
+        def gate(f, v):
+            if v == 0:
+                return int(f < 600)                       # full cycle
+            if v == 1:
+                return int(30 <= f < 60 or f >= 700)      # release during attack, later retrigger
+            return int(f < 400 or 450 <= f < 900)          # retrigger during release
+        vels = [65535, 40000, 20000]
+        m = Module()
+        m.submodules.dut = dut = MultiADSR(n=n_voices)
+        got = []
+
+        async def testbench(ctx):
+            ctx.set(dut.attack_rate, cfg["attack_inc"])
+            ctx.set(dut.decay_rate, cfg["decay_eps"])
+            ctx.set(dut.sustain_level.as_value(), cfg["sustain"])
+            ctx.set(dut.release_rate, cfg["release_eps"])
+            for v in range(n_voices):
+                ctx.set(dut.voice_velocity[v].as_value(), vels[v])
+            for f in range(n_frames):
+                for v in range(n_voices):
+                    ctx.set(dut.voice_gates[v], gate(f, v))
+                for v in range(n_voices):
+                    got.append(round((await stream.get(ctx, dut.o)).sample.as_float() * 65536))
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+
+        model = AdsrModel(n_voices)
+        expected = [model.voice(v, gate(f, v), vels[v], cfg["attack_inc"], cfg["decay_eps"],
+                                cfg["sustain"], cfg["release_eps"])[0]
+                    for f in range(n_frames) for v in range(n_voices)]
+        mismatches = [i for i, (a, b) in enumerate(zip(got, expected)) if a != b]
+        self.assertEqual(mismatches[:5], [], f"got {[got[i] for i in mismatches[:3]]}, "
+                         f"expected {[expected[i] for i in mismatches[:3]]}")
+        self.assertGreater(max(got), 60000)
+
+    def test_adsr_exponential_release(self):
+        """Release is exponential (straight line in dB) and hits -60 dB at the set time."""
+        t_rel = 0.25
+        model = AdsrModel(1)
+        args = (attack_inc_for_time(0.001), eps_for_time(0.001), 65535, eps_for_time(t_rel))
+        y = [model.voice(0, int(i < 2000), 65535, *args)[0] for i in range(2000 + int(0.3 * FS))]
+        rel = np.array(y[2000:], dtype=float)
+        db = 20 * np.log10(np.maximum(rel, 1e-9) / rel[0])
+        t60 = np.argmax(db < -60) / FS
+        self.assertAlmostEqual(t60, t_rel, delta=0.01 * t_rel)
+        mid = db[: int(0.8 * t_rel * FS)]
+        fit = np.polyfit(np.arange(len(mid)), mid, 1)
+        self.assertLess(np.max(np.abs(np.polyval(fit, np.arange(len(mid))) - mid)), 0.5)
+
     def test_juno_lfo_matches_model(self):
         """JunoLfo gateware is bit-exact with JunoLfoModel: fast rate (several
         cycles), delay ramp restarted by a new note after all keys released,
@@ -350,7 +410,7 @@ class JunoVoiceTests(unittest.TestCase):
         staggered notes + note-offs, PWM by LFO, vibrato, filter LFO, Gate mode,
         sub and noise, HPF bass boost, chorus I+II."""
         notes = [Note(0, 48, 0.0, 0.015), Note(1, 55, 0.003, 0.025), Note(2, 64, 0.008, 0.02)]
-        p = Params(attack=8192, decay=4096, sustain=30000, release=4096, pulse=True,
+        p = Params(attack=0.0002, decay=0.0005, sustain=0.46, release=0.0005, pulse=True,
                    pw=0.6, pwm_lfo=True, dco_lfo_semi=1.0, vcf_lfo=0.2,
                    lfo_rate_hz=200.0, vca_gate=True, sub=0.5, noise=0.2,
                    hpf=0, chorus=3)
@@ -361,7 +421,7 @@ class JunoVoiceTests(unittest.TestCase):
 
     def test_pitch_bend(self):
         """Pitch bend is exact in the log domain: +2 semitones on A4 -> B4."""
-        p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
+        p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001,
                    cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0, bend_semitones=2.0)
         out = render([Note(0, 69, 0.0, 1.0)], seconds=0.03, params=p)
         f = estimate_freq(out[len(out) // 4:, 0])
@@ -371,7 +431,7 @@ class JunoVoiceTests(unittest.TestCase):
     def test_pitch_full_range(self):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the
         16-bit freq_inc of the upstream tracker is -25 cents at C1, +13.5 at C2)."""
-        p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
+        p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001,
                    cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0)
         for note, seconds in [(24, 0.16), (36, 0.09), (48, 0.05), (84, 0.03), (96, 0.03)]:
             with self.subTest(note=note):
@@ -381,12 +441,12 @@ class JunoVoiceTests(unittest.TestCase):
                 cents = 1200 * np.log2(f / expected)
                 self.assertLess(abs(cents), 2.0, f"{f:.3f} Hz vs {expected:.3f} Hz")
 
-    # Envelope rates are per-sample increments of a 16-bit level: 2048 ≈ 16 samples
-    # for a full-scale ramp. Fast settings keep these renders short.
+    # Envelope times in seconds (attack to full, decay / release to -60 dB).
+    # Fast settings keep these renders short.
 
     def test_vca_release_goes_silent(self):
         """After note-off with a fast release, the VCA brings the output to ~0."""
-        p = Params(attack=8192, decay=8192, sustain=65535, release=2048)
+        p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001)
         out = render([Note(0, 60, 0.0, 0.015)], seconds=0.025, params=p)
         held = rms(out[int(0.008 * FS):int(0.015 * FS), 0])
         tail = rms(out[int(0.020 * FS):, 0])
@@ -397,7 +457,7 @@ class JunoVoiceTests(unittest.TestCase):
     # Brightness = spectral centroid of a held saw. Attack/decay are fast and
     # sustain is full, so the envelope sits at a constant level while measuring.
 
-    FAST_FULL = dict(attack=8192, decay=8192, sustain=65535, release=2048)
+    FAST_FULL = dict(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001)
 
     def _centroid(self, note=60, seconds=0.03, **kw):
         p = Params(**{**self.FAST_FULL, **kw})
@@ -405,11 +465,11 @@ class JunoVoiceTests(unittest.TestCase):
         return centroid(out[len(out) // 3:, 0])
 
     def test_cutoff_lut(self):
-        """LUT is monotonic and spans 12 Hz .. ~12 kHz over 10 octaves."""
+        """LUT is monotonic and spans 20 Hz .. ~20 kHz over 10 octaves."""
         lut = MultiLadder.cutoff_lut()
         self.assertTrue(all(b >= a for a, b in zip(lut, lut[1:])))
-        self.assertAlmostEqual(MultiLadder.cutoff_hz(0.0), 12.0)
-        self.assertAlmostEqual(MultiLadder.cutoff_hz(0.5), 12.0 * 32)
+        self.assertAlmostEqual(MultiLadder.cutoff_hz(0.0), 20.0)
+        self.assertAlmostEqual(MultiLadder.cutoff_hz(0.5), 20.0 * 32)
         self.assertGreater(MultiLadder.cutoff_hz(1023 / 1024), 12000)
 
     def test_cutoff_knob_brightness(self):
@@ -433,11 +493,11 @@ class JunoVoiceTests(unittest.TestCase):
         (two octaves up -> ~4x centroid). kbd=0: much less than 4x."""
         ratios = {}
         for kbd in (0.0, 1.0):
-            # cutoff 0.55 (~540 Hz at C4): with the 24 dB ladder a lower cutoff sits
-            # between the two notes and the high note's brightness follows its pitch
-            # even without tracking (ratio -> ~3 at cutoff 0.45)
-            lo = self._centroid(note=48, cutoff=0.55, env_amt=0.0, kbd=kbd)
-            hi = self._centroid(note=72, cutoff=0.55, env_amt=0.0, kbd=kbd)
+            # cutoff 0.3 (~160 Hz; tracking is relative to C1, so kbd=1 adds +2 oct at
+            # C3 and +4 oct at C5): both tracked cutoffs stay well below the top of
+            # the range, and without tracking the ratio stays far from 4 (1.27)
+            lo = self._centroid(note=48, cutoff=0.3, env_amt=0.0, kbd=kbd)
+            hi = self._centroid(note=72, cutoff=0.3, env_amt=0.0, kbd=kbd)
             ratios[kbd] = hi / lo
         self.assertAlmostEqual(ratios[1.0], 4.0, delta=0.6)
         self.assertLess(ratios[0.0], 3.0)
@@ -517,7 +577,7 @@ class JunoVoiceTests(unittest.TestCase):
         """Gate mode: with sustain 0 the envelope dies away, but the VCA holds
         the note at full level while the key is held, and cuts it quickly on
         release (the filter still follows the envelope)."""
-        p = Params(attack=8192, decay=2048, sustain=0, release=2048,
+        p = Params(attack=0.0002, decay=0.001, sustain=0, release=0.001,
                    cutoff=0.8, env_amt=0.0, kbd=0.0, vca_gate=True)
         out = render([Note(0, 60, 0.0, 0.012)], seconds=0.018, params=p)
         early = rms(out[int(0.002 * FS):int(0.004 * FS), 0])
@@ -530,7 +590,7 @@ class JunoVoiceTests(unittest.TestCase):
         """LFO -> pitch: 1 semitone depth at 40 Hz swings the period by about
         +-1 semitone; without vibrato the swing is ~0."""
         def swing_semitones(depth):
-            p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
+            p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001,
                        cutoff=0.9, env_amt=0.0, kbd=0.0, res=0.0, dco_lfo_semi=depth,
                        lfo_rate_hz=40.0)
             out = render([Note(0, 81, 0.0, 1.0)], seconds=0.06, params=p)
@@ -546,7 +606,7 @@ class JunoVoiceTests(unittest.TestCase):
 
     def test_vca_zero_sustain_decays_while_held(self):
         """Sustain 0: the note dies away although the gate is still held (pluck)."""
-        p = Params(attack=8192, decay=2048, sustain=0, release=2048)
+        p = Params(attack=0.0002, decay=0.004, sustain=0, release=0.001)
         out = render([Note(0, 60, 0.0, 1.0)], seconds=0.015, params=p)
         early = rms(out[:int(0.002 * FS), 0])
         late = rms(out[int(0.010 * FS):, 0])

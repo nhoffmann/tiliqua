@@ -165,10 +165,10 @@ class PolySynth(wiring.Component):
     drive: In(unsigned(16))
     reso: In(unsigned(16))
     env_amt: In(ASQ)
-    attack_rate: In(MultiADSR.EnvUQ)
-    decay_rate: In(MultiADSR.EnvUQ)
+    attack_rate: In(unsigned(32))
+    decay_rate: In(unsigned(17))
     sustain_level: In(MultiADSR.EnvUQ)
-    release_rate: In(MultiADSR.EnvUQ)
+    release_rate: In(unsigned(17))
 
     # Juno DCO mixer (global)
     saw_en: In(1)
@@ -321,16 +321,16 @@ class SynthPeripheral(wiring.Component):
         value: csr.Field(csr.action.W, unsigned(16))
 
     class AttackRate(csr.Register, access="w"):
-        value: csr.Field(csr.action.W, unsigned(16))
+        value: csr.Field(csr.action.W, unsigned(32))
 
     class DecayRate(csr.Register, access="w"):
-        value: csr.Field(csr.action.W, unsigned(16))
+        value: csr.Field(csr.action.W, unsigned(17))
 
     class SustainLevel(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
 
     class ReleaseRate(csr.Register, access="w"):
-        value: csr.Field(csr.action.W, unsigned(16))
+        value: csr.Field(csr.action.W, unsigned(17))
 
     class Dco(csr.Register, access="w"):
         saw:      csr.Field(csr.action.W, unsigned(1))

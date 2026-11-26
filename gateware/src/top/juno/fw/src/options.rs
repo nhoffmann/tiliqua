@@ -129,7 +129,8 @@ int_params!(CutoffParams<u16>     { step: 512, min: 0, max: 32768, format: IntFo
 int_params!(EnvAmtParams<u16>     { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(KbdTrackParams<u16>   { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(ResoParams<u16>       { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
-int_params!(AdsrTimeParams<u16>  { step: 1024, min: 0, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
+// ADSR times: knob = Juno-106 slider / 127 (fw env.rs maps it to KR-106-measured times)
+int_params!(AdsrTimeParams<u16>  { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(AdsrLevelParams<u16> { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(ScrollParams<u8>      { step: 1, min: 0, max: 125 });
 
@@ -171,7 +172,8 @@ pub struct DcoOpts {
     pub noise: IntOption<LevelParams>,
 }
 
-// Juno-style VCF: exponential cutoff (0..1 = 10 octaves, 12 Hz .. 12 kHz).
+// Juno-style VCF: exponential cutoff (20 Hz .. 20.5 kHz); the cutoff knob behaves like
+// the Juno-106 VCF FREQ slider (fw vcf.rs). Keyboard tracking relative to C1.
 #[derive(OptionPage, Clone)]
 pub struct VcfOpts {
     #[option(11469)]
@@ -202,11 +204,11 @@ pub struct EffectOpts {
 pub struct AdsrOpts {
     #[option(0)]
     pub attack: IntOption<AdsrTimeParams>,
-    #[option(4096)]
+    #[option(8192)]
     pub decay: IntOption<AdsrTimeParams>,
     #[option(16384)]
     pub sustain: IntOption<AdsrLevelParams>,
-    #[option(4096)]
+    #[option(6554)]
     pub release: IntOption<AdsrTimeParams>,
     #[option]
     pub vca_mode: EnumOption<VcaMode>,

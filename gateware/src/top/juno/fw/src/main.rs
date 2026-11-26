@@ -35,6 +35,7 @@ use static_cell::StaticCell;
 use tiliqua_fw::dco;
 use tiliqua_fw::lfo;
 use tiliqua_fw::vcf;
+use tiliqua_fw::env;
 
 pub const TICK_PERIOD_MS: u32 = 5;
 
@@ -45,13 +46,6 @@ const PERSIST_HELP: u8 = 64;
 
 // Mod wheel fully up opens the cutoff by 0.5 (5 octaves). Same as sim_render.py.
 const MOD_WHEEL_RANGE: i32 = 16384;
-
-fn adsr_ui_to_rate(ui_value: u16) -> u16 {
-    // 0..32768 -> 1ms..2000ms -> hardware rate
-    let ms_x32k = 32768u32 + u32::from(ui_value) * 1999;
-    let rate = (45_000_000u64 / u64::from(ms_x32k)) as u32;
-    rate.min(65535) as u16
-}
 
 fn tick_handler(app: &Mutex<RefCell<App>>) {
 
@@ -131,16 +125,16 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_fx(opts.vcf.hpf.value as u8, opts.effect.chorus.value as u8);
 
         // Exponential cutoff (normalized octaves, 32768 = 1.0 = 10 octaves).
-        // Per voice: knob + keyboard tracking (relative to C4) + mod wheel.
+        // Per voice: knob (Juno-106 slider curve) + keyboard tracking (relative to C1) + mod wheel.
         // Env amount (bipolar) and CV in1 are added per sample in gateware.
         {
-            let cutoff = i32::from(app.cutoff_smoother.proc_u16(opts.vcf.cutoff.value));
+            let cutoff = vcf::cutoff_knob_to_c(app.cutoff_smoother.proc_u16(opts.vcf.cutoff.value));
             let kbd = i32::from(opts.vcf.kbd_track.value);
             let mod_off = i32::from(app.mod_wheel) * MOD_WHEEL_RANGE / 127;
             let notes = app.synth.voice_notes();
             for (voice, note) in notes.iter().enumerate() {
-                // kbd * (note - 60) / 12 octaves, 1 octave = 1/10 = 3276.8 raw
-                let track = kbd * (i32::from(*note) - 60) / 120;
+                // kbd * (note - C1) / 12 octaves, 1 octave = 1/10 = 3276.8 raw
+                let track = kbd * (i32::from(*note) - vcf::KBD_REF_NOTE) / 120;
                 let base = (cutoff + track + mod_off).clamp(-32768, 32767);
                 app.synth.set_cutoff_base(voice, base as i16);
             }
@@ -155,10 +149,16 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_midi_channel_filter(opts.misc.midi_ch.value.to_filter());
 
         // ADSR params
-        app.synth.set_attack_rate(adsr_ui_to_rate(opts.adsr.attack.value));
-        app.synth.set_decay_rate(adsr_ui_to_rate(opts.adsr.decay.value));
+        // Juno-106-style envelope: knob = slider / 127 -> KR-106-measured times
+        // (float math only when a knob moves)
+        let env_knobs = (opts.adsr.attack.value, opts.adsr.decay.value, opts.adsr.release.value);
+        if app.last_env_knobs != Some(env_knobs) {
+            app.last_env_knobs = Some(env_knobs);
+            app.synth.set_attack_rate(env::attack_inc(env::knob_to_time(env_knobs.0, &env::ATTACK_S)));
+            app.synth.set_decay_rate(env::eps(env::knob_to_time(env_knobs.1, &env::DECAY_S)));
+            app.synth.set_release_rate(env::eps(env::knob_to_time(env_knobs.2, &env::RELEASE_S)));
+        }
         app.synth.set_sustain_level((u32::from(opts.adsr.sustain.value) * 65535 / 32768) as u16);
-        app.synth.set_release_rate(adsr_ui_to_rate(opts.adsr.release.value));
 
         // Juno DCO mixer + modes (live; cheap register writes every tick)
         app.synth.set_dco(opts.dco.saw.value == Switch::On,
@@ -242,6 +242,8 @@ struct App {
     cutoff_smoother: OnePoleSmoother,
     // last mod wheel (CC1) value, 0..127
     mod_wheel: u8,
+    // last envelope knobs written (attack, decay, release)
+    last_env_knobs: Option<(u16, u16, u16)>,
     // last LFO knobs written (rate, delay, dco depth, vcf depth)
     last_lfo_knobs: Option<(u16, u16, u16, u16)>,
     // midi cc mapper
@@ -264,6 +266,7 @@ impl App {
             cutoff_smoother,
             mod_wheel: 0,
             last_lfo_knobs: None,
+            last_env_knobs: None,
             cc_mapper,
         }
     }

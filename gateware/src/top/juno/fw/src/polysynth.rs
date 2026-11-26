@@ -65,11 +65,11 @@ impl Polysynth0 {
         }
     }
 
-    pub fn set_attack_rate(&mut self, value: u16)  {
+    pub fn set_attack_rate(&mut self, value: u32)  {
         self.registers.attack_rate().write(|w| unsafe { w.value().bits(value) } );
     }
 
-    pub fn set_decay_rate(&mut self, value: u16)  {
+    pub fn set_decay_rate(&mut self, value: u32)  {
         self.registers.decay_rate().write(|w| unsafe { w.value().bits(value) } );
     }
 
@@ -77,7 +77,7 @@ impl Polysynth0 {
         self.registers.sustain_level().write(|w| unsafe { w.value().bits(value) } );
     }
 
-    pub fn set_release_rate(&mut self, value: u16)  {
+    pub fn set_release_rate(&mut self, value: u32)  {
         self.registers.release_rate().write(|w| unsafe { w.value().bits(value) } );
     }
 

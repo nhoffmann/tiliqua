@@ -14,5 +14,6 @@ pub mod polysynth;
 pub mod dco;
 pub mod lfo;
 pub mod vcf;
+pub mod env;
 
 pub use polysynth::Polysynth0;

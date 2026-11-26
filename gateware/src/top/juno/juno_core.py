@@ -57,10 +57,12 @@ class JunoCore(wiring.Component):
             "env_amt":       In(ASQ),
             "cutoff_cv":     In(ASQ),
             "vca_gate_mode": In(1),
-            "attack_rate":   In(MultiADSR.EnvUQ),
-            "decay_rate":    In(MultiADSR.EnvUQ),
+            # Envelope (Juno-106 style, see adsr_model): attack increment (32 bit),
+            # decay / release eps (17 bit, 19 fractional bits), sustain UQ(0,16)
+            "attack_rate":   In(unsigned(32)),
+            "decay_rate":    In(unsigned(17)),
             "sustain_level": In(MultiADSR.EnvUQ),
-            "release_rate":  In(MultiADSR.EnvUQ),
+            "release_rate":  In(unsigned(17)),
 
             # HPF / chorus (JunoFx)
             "hpf_mode":      In(2),

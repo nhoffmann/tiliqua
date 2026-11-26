@@ -311,6 +311,14 @@ SCENES = {
                           for i, n in enumerate([36, 43, 39, 36]) for v in range(6)],
                Params(variance=1.0, unison_detune=0.3, portamento=0.03, cutoff=0.5,
                       env_amt=0.5, sustain=0.7, release=0.4)),
+    # hardware test references (docs/HARDWARE_TEST_PLAN.md T3): A4 tuning tone
+    # (440 Hz, open filter, no env) and the DCO range switch on the same note
+    "tune_a4": (lambda s: [Note(0, 69, 0.0, s * 0.9)],
+                Params(cutoff=1.0, env_amt=0.0, kbd=0.0, saw=True, sustain=1.0)),
+    **{f"range_{name}": (lambda s: [Note(0, 57, 0.0, s * 0.9)],
+                         Params(cutoff=1.0, env_amt=0.0, kbd=0.0, saw=True, sustain=1.0,
+                                dco_range=r))
+       for name, r in (("16", 0), ("8", 1), ("4", 2))},
     # portamento: one voice C3 -> C4 -> G3 -> C3 (time constant 80 ms), then a
     # two-voice chord moving up a fourth (each voice glides from its own last note)
     "portamento": (lambda s: [Note(0, n, i * s / 8, (i + 1) * s / 8)

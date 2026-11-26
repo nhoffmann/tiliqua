@@ -10,7 +10,7 @@ tiliqua_lib::impl_handlers!(Serial0);
 tiliqua_lib::impl_tick!(Clint);
 
 pub mod options;
-pub mod polysynth;
+pub mod synth;
 pub mod dco;
 pub mod lfo;
 pub mod glide;
@@ -20,4 +20,4 @@ pub mod cv;
 pub mod vcf;
 pub mod env;
 
-pub use polysynth::Polysynth0;
+pub use synth::Synth;

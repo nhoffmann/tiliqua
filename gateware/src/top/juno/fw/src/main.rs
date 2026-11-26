@@ -300,7 +300,7 @@ type Ui = ui::UI<Encoder0, EurorackPmod0, I2cDevice<'static, I2c0>, Opts>;
 
 struct App {
     ui: Ui,
-    synth: Polysynth0,
+    synth: Synth,
     drive_smoother: OnePoleSmoother,
     out_gain_smoother: OnePoleSmoother,
     reso_smoother: OnePoleSmoother,
@@ -320,7 +320,7 @@ struct App {
 }
 
 impl App {
-    pub fn new(ui: Ui, mut synth: Polysynth0) -> Self {
+    pub fn new(ui: Ui, mut synth: Synth) -> Self {
         let drive_smoother = OnePoleSmoother::new(0.05f32);
         let out_gain_smoother = OnePoleSmoother::new(0.05f32);
         let reso_smoother = OnePoleSmoother::new(0.05f32);
@@ -400,7 +400,7 @@ fn main() -> ! {
 
     let ui = ui::UI::new(opts, TICK_PERIOD_MS, Encoder0::new(peripherals.ENCODER0),
                          Pca9635Driver::new(I2cDevice::new(i2c0)), pmod);
-    let app = Mutex::new(RefCell::new(App::new(ui, Polysynth0::new(peripherals.SYNTH_PERIPH))));
+    let app = Mutex::new(RefCell::new(App::new(ui, Synth::new(peripherals.SYNTH_PERIPH))));
 
     handler!(tick_isr = || tick_handler(&app));
 

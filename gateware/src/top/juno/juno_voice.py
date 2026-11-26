@@ -1021,7 +1021,7 @@ class MultiLadder(wiring.Component):
 class VoiceMixer(wiring.Component):
     """
     Sum N voices to mono (Juno: the stereo image comes from the chorus only).
-    Each voice is scaled by 0.75 * 2 / N (polysyn's per-side gain, now summed),
+    Each voice is scaled by 0.75 * 2 / N (the upstream voice block's per-side gain, now summed),
     the sum saturates instead of wrapping.
 
     Phase 4.7: the output is ``osq`` (``JunoVoice``: 18-bit ``SQNative``, +-4), so a

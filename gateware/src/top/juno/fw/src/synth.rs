@@ -2,11 +2,11 @@ use crate::pac;
 use pac::constants::N_VOICES;
 
 #[derive(Debug)]
-pub struct Polysynth0 {
+pub struct Synth {
     registers: pac::SYNTH_PERIPH,
 }
 
-impl Polysynth0 {
+impl Synth {
     pub fn new(registers: pac::SYNTH_PERIPH) -> Self {
         Self { registers }
     }

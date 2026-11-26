@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 """
-6-voice MIDI polysynth (Juno port, work in progress).
+Juno-style 6-voice MIDI synth (Juno port of the upstream polysyn example, work in progress).
 
     .. code-block:: text
 
@@ -167,7 +167,7 @@ from juno_tracker import JunoVoiceState, JunoVoiceTracker
 from juno_output import knee
 from juno_cv import JunoCvRouter, JunoCvOut
 
-class PolySynth(wiring.Component):
+class JunoSynth(wiring.Component):
 
     N_VOICES = 6
 
@@ -503,11 +503,11 @@ class SynthPeripheral(wiring.Component):
         self.synth = synth
         # 8-bit address space (256 B): the 128 B window filled up with the LFO registers
         regs = csr.Builder(addr_width=8, data_width=8)
-        voices_csr_end = 0x8+PolySynth.N_VOICES*4
+        voices_csr_end = 0x8+JunoSynth.N_VOICES*4
         self._drive         = regs.add("drive",         self.Drive(),         offset=0x0)
         self._reso          = regs.add("reso",          self.Reso(),          offset=0x4)
         self._voices        = [regs.add(f"voices{i}",   self.Voice(),
-                               offset=0x8+i*4) for i in range(PolySynth.N_VOICES)]
+                               offset=0x8+i*4) for i in range(JunoSynth.N_VOICES)]
         # +0x0 / +0x4 were the Diffuser matrix registers (Diffuser replaced by JunoFx)
         self._fx            = regs.add("fx",            self.Fx(),            offset=voices_csr_end + 0x0)
         self._midi_write    = regs.add("midi_write",    self.MidiWrite(),     offset=voices_csr_end + 0x8)
@@ -526,7 +526,7 @@ class SynthPeripheral(wiring.Component):
         self._midi_ch_filt  = regs.add("midi_ch_filter",self.MidiChannelFilter(), offset=voices_csr_end + 0x38)
         self._env_amt       = regs.add("env_amt",       self.EnvAmt(),        offset=voices_csr_end + 0x3C)
         self._cutoff_base   = [regs.add(f"cutoff_base{i}", self.CutoffBase(),
-                               offset=voices_csr_end + 0x40 + i*4) for i in range(PolySynth.N_VOICES)]
+                               offset=voices_csr_end + 0x40 + i*4) for i in range(JunoSynth.N_VOICES)]
         self._lfo_rate      = regs.add("lfo_rate",      self.LfoRate(),       offset=voices_csr_end + 0x58)
         self._lfo_delay     = regs.add("lfo_delay",     self.LfoDelay(),      offset=voices_csr_end + 0x5C)
         self._lfo_depths    = regs.add("lfo_depths",    self.LfoDepths(),     offset=voices_csr_end + 0x60)
@@ -681,14 +681,14 @@ class SynthPeripheral(wiring.Component):
 
         return m
 
-class PolySoc(TiliquaSoc):
+class JunoSoc(TiliquaSoc):
 
     # Used by `tiliqua_soc.py` to create a MODULE_DOCSTRING rust constant used by the 'help' page.
     module_docstring = sys.modules[__name__].__doc__
 
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
-        brief="MIDI Polysynth (6-voice, Juno WIP)",
+        brief="Juno-style 6-voice MIDI synth (WIP)",
         io_left=['', 'filter cv', 'drive cv', '', '', 'clk', 'out L', 'out R'],
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
@@ -706,7 +706,7 @@ class PolySoc(TiliquaSoc):
         self.csr_decoder.add(self.synth_periph.bus, addr=self.synth_periph_base, name="synth_periph")
 
         self.add_rust_constant(
-            f"pub const N_VOICES: usize = {PolySynth.N_VOICES};\n")
+            f"pub const N_VOICES: usize = {JunoSynth.N_VOICES};\n")
 
         # now we can freeze the memory map
         self.finalize_csr_bridge()
@@ -715,8 +715,8 @@ class PolySoc(TiliquaSoc):
 
         m = Module()
 
-        m.submodules.polysynth = polysynth = PolySynth()
-        self.synth_periph.synth = polysynth
+        m.submodules.synth = synth = JunoSynth()
+        self.synth_periph.synth = synth
 
         m.submodules.synth_periph = self.synth_periph
 
@@ -725,7 +725,7 @@ class PolySoc(TiliquaSoc):
         pmod0 = self.pmod0_periph.pmod
 
         if sim.is_hw(platform):
-            # Polysynth hardware MIDI sources
+            # Synth hardware MIDI sources
 
             # TRS MIDI (serial)
             midi_pins = platform.request("midi")
@@ -757,19 +757,19 @@ class PolySoc(TiliquaSoc):
             # a CV output now); drain both RT streams.
             m.d.comb += [midi_decode_trs.o_rt.ready.eq(1), midi_decode_usb.o_rt.ready.eq(1)]
 
-        # polysynth audio + jack detection
-        wiring.connect(m, pmod0.o_cal, polysynth.i)
-        m.d.comb += polysynth.jack.eq(pmod0.jack)
+        # synth audio + jack detection
+        wiring.connect(m, pmod0.o_cal, synth.i)
+        m.d.comb += synth.jack.eq(pmod0.jack)
 
         m.d.comb += [
-            pmod0.i_cal.payload[0].eq(polysynth.o.payload[0]),
+            pmod0.i_cal.payload[0].eq(synth.o.payload[0]),
             # Channel 0 / 1: CV outputs (juno_cv.JunoCvOut)
-            pmod0.i_cal.payload[1].eq(polysynth.o.payload[1]),
+            pmod0.i_cal.payload[1].eq(synth.o.payload[1]),
             # Channel 2/3 are stereo outputs
-            pmod0.i_cal.payload[2].eq(polysynth.o.payload[2]),
-            pmod0.i_cal.payload[3].eq(polysynth.o.payload[3]),
-            pmod0.i_cal.valid.eq(polysynth.o.valid),
-            polysynth.o.ready.eq(pmod0.i_cal.ready),
+            pmod0.i_cal.payload[2].eq(synth.o.payload[2]),
+            pmod0.i_cal.payload[3].eq(synth.o.payload[3]),
+            pmod0.i_cal.valid.eq(synth.o.valid),
+            synth.o.ready.eq(pmod0.i_cal.ready),
         ]
 
         return m
@@ -777,4 +777,4 @@ class PolySoc(TiliquaSoc):
 
 if __name__ == "__main__":
     this_path = os.path.dirname(os.path.realpath(__file__))
-    top_level_cli(PolySoc, path=this_path, archiver_callback=lambda archiver: archiver.with_option_storage())
+    top_level_cli(JunoSoc, path=this_path, archiver_callback=lambda archiver: archiver.with_option_storage())

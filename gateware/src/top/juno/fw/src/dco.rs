@@ -2,30 +2,16 @@
 //!
 //! Keep `pw_knob_to_point` / `sub_gain` in sync with `sim_render.py`.
 
-use micromath::F32Ext;
 
 /// Option range of the DCO knobs (0..32768 = 0..1).
 const KNOB_ONE: f32 = 32768.0;
 
-fn sqrt_precise(v: f32) -> f32 {
-    // micromath's sqrt is an approximation; refine with two Newton steps.
-    let mut x = v.sqrt();
-    if x > 0.0 {
-        x = 0.5 * (x + v / x);
-        x = 0.5 * (x + v / x);
-    }
-    x
-}
-
-/// PW knob (0..32768) -> pulse rising-edge phase, UQ(0,16).
-///
-/// Juno: the pulse comparator sits on the curved ramp p (1 + 0.15 (1 - p)) at
-/// threshold 0.5 + 0.46 * knob (duty ~54 % .. ~4.5 %). The oscillator compares the
-/// *linear* phase, so solve the curve for p.
+/// PW knob (0..32768) -> pulse rising-edge phase, UQ(0,16), for the menu preview.
+/// Same as `juno_lfo.pw_knob_to_point` (the gateware LUT): duty linear from 50 %
+/// (exact square) to 26.4 %, measured on the KR-106.
 pub fn pw_knob_to_point(knob: u16) -> u16 {
     let k = f32::from(knob) / KNOB_ONE;
-    let th = 0.5 + 0.46 * k;
-    let p = (1.15 - sqrt_precise(1.15 * 1.15 - 0.6 * th)) / 0.3;
+    let p = 0.5 - 0.236 * k;
     let v = (p * 65536.0 + 0.5) as u32;
     v.min(65535) as u16
 }

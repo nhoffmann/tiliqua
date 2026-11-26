@@ -13,7 +13,7 @@ Layer 1 of the Juno VCF (see ``docs/JUNO_PORTING_PLAN.md``):
 - Resonance ``k = 4.5 res`` (self-oscillates near the top), Q compensation
   ``x * (1 + 0.5 res^2)`` (Juno BA662 behaviour, per KR-106 docs).
 - 2x oversampling: the input is held for two filter iterations, the two outputs
-  are averaged.
+  are summed; input scaled by 1/4 (drive calibrated against the KR-106).
 - ``G = g / (1 + g)``, ``g = tan(pi fc / 96 kHz)`` from a 1024-entry cutoff LUT;
   ``1 / (1 + k G^4) ~= 1 - e + e^2`` (``e = k G^4 <= 0.04``, error < 1e-4).
 
@@ -35,6 +35,27 @@ TANH_FRAC_BITS = 17 - TANH_LUT_BITS   # |u| raw < 2**17
 K_HALF_SCALE = 73728           # 2.25 * 2**15: k / 2 = res * 2.25
 DC_SHIFT = 9
 GATE_STEP = 1 << 10
+# Drive / gain staging, calibrated against the KR-106 (tools/kr106_compare.py):
+# a full-level oscillator mix overdrove the tanh (saw + sub balance -10.9 dB vs
+# KR-106 -8.3 dB). The input is scaled down by 2**IN_SHIFT and the two
+# oversampled outputs are summed (not averaged / halved), so the linear gain
+# through the filter is unchanged but the drive into the saturation is 12 dB lower.
+IN_SHIFT = 2
+OUT_SHIFT = 0
+
+# Resonance knob -> internal resonance (the `reso` register, k = 4.5 res), piecewise
+# linear at knob = 0, 1/8, ..., 1. Calibrated so the resonance peak (saw C2, cutoff
+# ~800 Hz) matches the KR-106 Juno-106 RES slider; the KR-106 reaches
+# self-oscillation only at the very top. Applied by the firmware (fw/src/vcf.rs)
+# and by sim_render.prepare(); the gateware takes the register value.
+RES_CURVE = [0.0, 0.19, 0.375, 0.4625, 0.55, 0.62, 0.715, 0.825, 0.95]
+
+
+def res_knob_to_reg(knob):
+    """Resonance knob 0..1 -> `reso` register value 0..32768."""
+    k = min(max(knob, 0.0), 1.0) * (len(RES_CURVE) - 1)
+    i = min(int(k), len(RES_CURVE) - 2)
+    return round((RES_CURVE[i] + (k - i) * (RES_CURVE[i + 1] - RES_CURVE[i])) * ONE)
 
 
 def mul(a, b):
@@ -110,7 +131,7 @@ class LadderModel:
         # resonance and Q compensation (global, recomputed per voice)
         k_half = mul(res, K_HALF_SCALE)
         comp = ONE + (mul(res, res) >> 1)
-        xc = mul(x, comp)
+        xc = mul(x >> IN_SHIFT, comp)
         G2 = mul(G, G)
         G4 = mul(G2, G2)
         e = 2 * mul(k_half, G4)
@@ -129,7 +150,7 @@ class LadderModel:
                 s[i] = sat(y + vv)
                 xi = y
             acc += xi
-        out = acc >> 2                      # average of 2, then / 2
+        out = acc >> OUT_SHIFT              # sum of the 2 oversampled outputs
 
         # DC block
         self.dc_y[v] = out - self.dc_x[v] + self.dc_y[v] - (self.dc_y[v] >> DC_SHIFT)

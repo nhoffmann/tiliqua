@@ -34,6 +34,7 @@ use static_cell::StaticCell;
 
 use tiliqua_fw::dco;
 use tiliqua_fw::lfo;
+use tiliqua_fw::vcf;
 
 pub const TICK_PERIOD_MS: u32 = 5;
 
@@ -123,8 +124,8 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_drive(drive_smooth);
 
         // Map 0-1 UI range to 32768-8192 hardware range (inverted)
-        // Ladder resonance knob 0..32768 (gateware: k = 4.5 res, Q compensation)
-        let reso_smooth = app.reso_smoother.proc_u16(opts.vcf.reso.value);
+        // Ladder resonance: knob -> KR-106-calibrated curve (gateware: k = 4.5 res)
+        let reso_smooth = app.reso_smoother.proc_u16(vcf::res_knob_to_reg(opts.vcf.reso.value));
         app.synth.set_reso(reso_smooth);
 
         let diffuse_smooth = app.diffusion_smoother.proc_u16(opts.effect.diffuse.value);

@@ -20,7 +20,8 @@ Per voice and sample:
 5. Sub: square one octave down, gentle one-pole low-pass (``y += (x - y) / 2``).
 6. Noise: one 32-bit Galois LFSR shared by all voices, advanced once per frame,
    one-pole low-pass (spectral tilt).
-7. Mixer: saw / 2 + pulse / 2 + sub * sub_gain + noise * noise_gain, saturated.
+7. Mixer: saw / 2 + pulse / 2 + sub * sub_gain + noise * noise_gain, saturated
+   at the 18-bit range (+-4.0; the full mix peaks at +-2.67).
 """
 
 ONE = 1 << 15                 # 1.0 in 15-bit fixed point
@@ -28,6 +29,7 @@ CURVE = 4915                  # 0.15 * 2**15
 LFSR_TAPS = 0x80200003        # 32-bit maximal-length Galois LFSR
 LFSR_SEED = 0xACE1ACE1
 DIV_BITS = 16
+OUT_SAT = (1 << 17) - 1      # 18-bit output: the full mix reaches the ladder unclipped
 
 
 def div_frac(d, den):
@@ -121,4 +123,4 @@ class OscModel:
             acc += pulse >> 1
         acc += (self.sub_lp[v] * (sub_gain >> 1)) >> 15
         acc += (self.noise_lp * (noise_gain >> 1)) >> 15
-        return max(-ONE, min(ONE - 1, acc))
+        return max(-OUT_SAT, min(OUT_SAT, acc))

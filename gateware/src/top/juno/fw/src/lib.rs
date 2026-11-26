@@ -13,5 +13,6 @@ pub mod options;
 pub mod polysynth;
 pub mod dco;
 pub mod lfo;
+pub mod vcf;
 
 pub use polysynth::Polysynth0;

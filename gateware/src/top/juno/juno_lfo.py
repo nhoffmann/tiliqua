@@ -24,8 +24,6 @@ All audio-rate values use 15 fractional bits (32768 = 1.0). ``JunoLfoModel`` is 
 bit-exact Python model; ``tests/test_juno_voice.py`` checks the gateware against it.
 """
 
-import math
-
 from amaranth import *
 from amaranth.lib import wiring
 from amaranth.lib.memory import Memory
@@ -38,13 +36,17 @@ AMP_BITS = 30
 PW_LUT_BITS = 8
 
 
+# PW knob 0..1 -> pulse duty: linear from 50 % (exact square) down to 26.4 %,
+# measured on the KR-106 (Juno-106 mode, PWM slider 0..105) with
+# tools/kr106_compare.py. The KR-106 compensates its ramp curvature, so knob 0
+# is an exact square. (Phase 1b used a comparator on the curved ramp: 54 %..4.5 %.)
+PW_DUTY_SPAN = 0.236
+
+
 def pw_knob_to_point(knob):
-    """PW knob 0..1 -> pulse rising-edge phase, UQ(0,16).
-    Juno: comparator at threshold 0.5 + 0.46 * knob on the curved ramp
-    p (1 + 0.15 (1 - p)); solved for the linear phase p (duty ~54 % .. ~4.5 %)."""
-    th = 0.5 + 0.46 * knob
-    p = (1.15 - math.sqrt(1.15 ** 2 - 0.6 * th)) / 0.3
-    return min(65535, round(p * 65536))
+    """PW knob 0..1 -> pulse rising-edge phase, UQ(0,16). The pulse is high for
+    ``1 - point`` of the cycle, i.e. 50 % .. 73.6 % high (= 50 % .. 26.4 % duty)."""
+    return min(65535, round((0.5 - PW_DUTY_SPAN * knob) * 65536))
 
 
 def pw_curve_lut():

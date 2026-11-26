@@ -33,6 +33,7 @@ from tiliqua.test import stream
 from top.juno.juno_core import JunoCore
 from top.juno.juno_lfo import pw_knob_to_point
 from top.juno.juno_voice import MultiADSR, MultiLadder, PitchToInc
+from top.juno.ladder_model import res_knob_to_reg
 
 FS = 48000
 N_VOICES = 6
@@ -127,7 +128,7 @@ def prepare(notes, seconds, params=None):
         "decay_rate":     params.decay,
         "sustain_level":  params.sustain,
         "release_rate":   params.release,
-        "reso":           round(min(params.res, 1.0) * 32768),
+        "reso":           res_knob_to_reg(params.res),   # KR-106-calibrated curve
         "env_amt":        _raw(params.env_amt, ASQ),
         "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
     }

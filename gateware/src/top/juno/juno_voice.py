@@ -231,7 +231,11 @@ class MultiJunoOsc(wiring.Component):
     CURVE = 4915        # 0.15 * 2**15
     ONE = 1 << 15
 
-    def __init__(self, n, sq=ASQ):
+    # Output is 18-bit (SQNative, +-4.0): the full Juno mix (saw + pulse + sub +
+    # noise, up to +-2.67) reaches the ladder unclipped, like the analog mixer.
+    OUT_SAT = (1 << 17) - 1
+
+    def __init__(self, n, sq=mac.SQNative):
         self.n = n
         self.sq = sq
         super().__init__({
@@ -306,7 +310,7 @@ class MultiJunoOsc(wiring.Component):
         saw    = Signal(signed(W))
         pulse  = Signal(signed(W))
         acc    = Signal(signed(W + 2))
-        out    = Signal(signed(16))
+        out    = Signal(signed(18))
 
         def corr(near, after, c, after_sign):
             """+-c (after_sign for 'after the edge', opposite before), 0 if not near."""
@@ -457,10 +461,10 @@ class MultiJunoOsc(wiring.Component):
                              mac_b.as_value().eq(self.noise_gain >> 1)]
                 with mp.Multiply(m, a=mac_a, b=mac_b):
                     total = acc + mac_z
-                    with m.If(total > ONE - 1):
-                        m.d.sync += out.eq(ONE - 1)
-                    with m.Elif(total < -ONE):
-                        m.d.sync += out.eq(-ONE)
+                    with m.If(total > self.OUT_SAT):
+                        m.d.sync += out.eq(self.OUT_SAT)
+                    with m.Elif(total < -self.OUT_SAT):
+                        m.d.sync += out.eq(-self.OUT_SAT)
                     with m.Else():
                         m.d.sync += out.eq(total)
                     m.next = 'STORE'
@@ -709,12 +713,13 @@ class MultiLadder(wiring.Component):
         """TPT stage coefficient G = g / (1 + g) (15-bit)."""
         return LM.g_lut()
 
-    def __init__(self, n, sq=ASQ, env_uq=MultiADSR.EnvUQ, macp=None):
+    def __init__(self, n, sq=ASQ, env_uq=MultiADSR.EnvUQ, macp=None, x_sq=mac.SQNative):
         self.n = n
         self.sq = sq
         self.macp = macp or PipelinedMAC()
         super().__init__({
-            "i":    In(stream.Signature(Block(data.StructLayout({"x": sq, "env": env_uq})))),
+            # x: oscillator mix, 18 bit (+-4.0, see MultiJunoOsc.OUT_SAT)
+            "i":    In(stream.Signature(Block(data.StructLayout({"x": x_sq, "env": env_uq})))),
             "reso": In(unsigned(16)),
             "voice_cutoff_base": In(data.ArrayLayout(ASQ, n)),
             "env_amt":    In(ASQ),
@@ -873,7 +878,8 @@ class MultiLadder(wiring.Component):
             with m.State('COMP'):
                 multiply(self.reso, self.reso, lambda z: [comp.eq(ONE + (z >> 1))], 'XCOMP')
             with m.State('XCOMP'):
-                multiply(x, comp, lambda z: [xc.eq(z)], 'G2')
+                # drive calibrated against the KR-106: input / 4, output summed
+                multiply(x >> LM.IN_SHIFT, comp, lambda z: [xc.eq(z)], 'G2')
             with m.State('G2'):
                 multiply(G, G, lambda z: [G2.eq(z)], 'G4')
             with m.State('G4'):
@@ -940,7 +946,7 @@ class MultiLadder(wiring.Component):
             # --- DC block, gate level, VCA ------------------------------------
             with m.State('DC-BLOCK'):
                 o = Signal(signed(W))
-                m.d.comb += o.eq(acc >> 2)
+                m.d.comb += o.eq(acc >> LM.OUT_SHIFT)
                 m.d.sync += [
                     dc_y.eq(o - dc_x + dc_y - (dc_y >> LM.DC_SHIFT)),
                     dc_x.eq(o),
@@ -1120,9 +1126,9 @@ class JunoVoice(wiring.Component):
         N = self.n_voices
 
         sq = self.sq
-        m.submodules.osc = osc = MultiJunoOsc(n=N, sq=sq)
+        m.submodules.osc = osc = MultiJunoOsc(n=N)   # 18-bit output, see OUT_SAT
         m.submodules.adsr = adsr = MultiADSR(n=N)
-        m.submodules.merge = merge = BlockMerge({"x": sq, "env": MultiADSR.EnvUQ})
+        m.submodules.merge = merge = BlockMerge({"x": mac.SQNative, "env": MultiADSR.EnvUQ})
         # Juno 4-pole ladder (layer 1) with cutoff path, DC block, VCA, Gate mode
         m.submodules.svf = svf = MultiLadder(n=N, sq=sq, macp=PipelinedMAC())
         m.submodules.mixer = mixer = VoiceMixer(n=N, sq=sq)

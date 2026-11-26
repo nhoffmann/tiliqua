@@ -18,7 +18,8 @@ from amaranth.sim import Simulator
 
 from amaranth_future import fixed
 
-from tiliqua.dsp import ASQ
+from tiliqua.dsp import ASQ, mac
+LADDER_X_SQ = mac.SQNative
 from top.juno.juno_voice import MultiADSR, MultiJunoOsc, MultiLadder, PipelinedMAC, PitchToInc
 from top.juno.juno_lfo import JunoLfo, JunoLfoModel
 from top.juno.osc_model import OscModel
@@ -186,7 +187,7 @@ class JunoVoiceTests(unittest.TestCase):
                     ctx.set(dut.voice_gates[v], gate)
                     ctx.set(dut.vca_gate_mode, gate_mode)
                     await stream.put(ctx, dut.i, {"first": v == 0,
-                                                  "sample": {"x": fixed.Const(x / 32768, shape=ASQ),
+                                                  "sample": {"x": fixed.Const(x / 32768, shape=LADDER_X_SQ),
                                                              "env": fixed.Const(env / 65536, shape=MultiADSR.EnvUQ)}})
                     got.append(round((await stream.get(ctx, dut.o)).sample.as_float() * 32768))
 
@@ -233,13 +234,24 @@ class JunoVoiceTests(unittest.TestCase):
         self.assertLess(self._gain_db(fc, 0.5, 0.0), self._gain_db(fc / 4, 0.5, 0.0))
 
     def test_ladder_self_oscillates(self):
-        """Max resonance + a kick: sustained oscillation near the cutoff frequency."""
+        """Max resonance: a full-scale kick starts a sustained oscillation near the
+        cutoff, and with a held note the resonance at the cutoff dominates. (Very
+        small kicks die out: the input enters at 1/4 for KR-106 drive; noise
+        seeding is ladder layer 2.)"""
         x = np.zeros(24000)
-        x[0] = 0.5 * 32768
+        x[0] = (1 << 17) - 1
         y = self._ladder(x, 0.5, 1.0)
         self.assertGreater(np.std(y[-4800:]), 0.02)
         f = estimate_freq(y[-8192:])
         self.assertLess(abs(np.log2(f / MultiLadder.cutoff_hz(0.5))), 0.5)
+        osc = OscModel(1)
+        inc = PitchToInc.model(48 * 1024)
+        saw = [osc.voice(0, inc, saw_en=1, pulse_en=0, pw_point=0, sub_gain=0, noise_gain=0)
+               for _ in range(24000)]
+        y = self._ladder(saw, 0.5, 1.0)
+        spec = np.abs(np.fft.rfft(y[-8192:] * np.hanning(8192)))
+        fpk = np.fft.rfftfreq(8192, 1 / FS)[np.argmax(spec)]
+        self.assertLess(abs(np.log2(fpk / MultiLadder.cutoff_hz(0.5))), 0.1)
 
     def test_juno_lfo_matches_model(self):
         """JunoLfo gateware is bit-exact with JunoLfoModel: fast rate (several
@@ -301,7 +313,7 @@ class JunoVoiceTests(unittest.TestCase):
     def test_pitch_bend(self):
         """Pitch bend is exact in the log domain: +2 semitones on A4 -> B4."""
         p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
-                   cutoff=0.85, env_amt=0.0, kbd=0.0, bend_semitones=2.0)
+                   cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0, bend_semitones=2.0)
         out = render([Note(0, 69, 0.0, 1.0)], seconds=0.03, params=p)
         f = estimate_freq(out[len(out) // 4:, 0])
         expected = 440.0 * 2 ** (2 / 12)
@@ -311,7 +323,7 @@ class JunoVoiceTests(unittest.TestCase):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the
         16-bit freq_inc of the upstream tracker is -25 cents at C1, +13.5 at C2)."""
         p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
-                   cutoff=0.85, env_amt=0.0, kbd=0.0)
+                   cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0)
         for note, seconds in [(24, 0.16), (36, 0.09), (48, 0.05), (84, 0.03), (96, 0.03)]:
             with self.subTest(note=note):
                 expected = 440.0 * 2 ** ((note - 69) / 12)
@@ -359,9 +371,11 @@ class JunoVoiceTests(unittest.TestCase):
 
     def test_env_amount_opens_filter(self):
         """Positive env amount opens the filter, negative closes it."""
-        neutral = self._centroid(cutoff=0.4, env_amt=0.0, kbd=0.0)
-        pos     = self._centroid(cutoff=0.4, env_amt=0.3, kbd=0.0)
-        neg     = self._centroid(cutoff=0.4, env_amt=-0.15, kbd=0.0)
+        # cutoff 0.55 (~540 Hz): far lower and the closed filter output of a C4
+        # rounds to zero in the ladder's 15-bit fixed point
+        neutral = self._centroid(cutoff=0.55, env_amt=0.0, kbd=0.0)
+        pos     = self._centroid(cutoff=0.55, env_amt=0.3, kbd=0.0)
+        neg     = self._centroid(cutoff=0.55, env_amt=-0.15, kbd=0.0)
         self.assertGreater(pos, 1.5 * neutral)
         self.assertLess(neg, neutral / 1.2)
 
@@ -395,8 +409,9 @@ class JunoVoiceTests(unittest.TestCase):
         return np.array([model.voice(0, inc, **{**base, **cfg}) for _ in range(n)]) / 32768
 
     def test_pw_knob_mapping(self):
-        """PW knob 0 -> ~54 % duty (near square), knob 1 -> ~4.5 % (as in Phase 1b)."""
-        for knob, duty in [(0.0, 0.537), (1.0, 0.045)]:
+        """PW knob 0 -> exact square, knob 1 -> 26.4 % duty (pulse high 73.6 % of
+        the cycle), linear in between: measured on the KR-106."""
+        for knob, duty in [(0.0, 0.5), (0.5, 0.618), (1.0, 0.736)]:
             x = self._osc(60, pulse_en=1, pw_point=pw_knob_to_point(knob))
             self.assertAlmostEqual(np.mean(x > 0), duty, delta=0.01)
 
@@ -467,7 +482,7 @@ class JunoVoiceTests(unittest.TestCase):
         +-1 semitone; without vibrato the swing is ~0."""
         def swing_semitones(depth):
             p = Params(attack=8192, decay=8192, sustain=65535, release=2048,
-                       cutoff=0.9, env_amt=0.0, kbd=0.0, dco_lfo_semi=depth,
+                       cutoff=0.9, env_amt=0.0, kbd=0.0, res=0.0, dco_lfo_semi=depth,
                        lfo_rate_hz=40.0)
             out = render([Note(0, 81, 0.0, 1.0)], seconds=0.06, params=p)
             x = out[len(out) // 6:, 0]

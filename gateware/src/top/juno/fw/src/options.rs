@@ -185,7 +185,7 @@ pub struct VoiceOpts {
 // Juno LFO (JunoLfo): one global triangle LFO with delay (fade-in after a new
 // note). Knobs = Juno-106 sliders, KR-106-measured curves (fw lfo.rs).
 // Pages and option order follow the Juno-106 panel: LFO, DCO, VCF (incl. HPF),
-// ENV (VCA mode + ADSR), FX (chorus, drive).
+// ENV (VCA mode + ADSR), FX (chorus, output level, drive).
 #[derive(OptionPage, Clone)]
 pub struct LfoOpts {
     #[option(21299)]
@@ -236,11 +236,16 @@ pub struct VcfOpts {
     pub kbd_track: IntOption<KbdTrackParams>,
 }
 
+// Output stage (juno_output / fw out.rs): level (clean up to ~5 V, soft limiter
+// above; default 0.45 = default 6-voice chord at ~5 V), drive (extra gain into the
+// limiter with level compensation; 0 = off = clean Juno).
 #[derive(OptionPage, Clone)]
 pub struct EffectOpts {
     #[option]
     pub chorus: EnumOption<ChorusMode>,
-    #[option(8192)]
+    #[option(14746)]
+    pub level: IntOption<LevelParams>,
+    #[option(0)]
     pub drive: IntOption<DriveParams>,
 }
 

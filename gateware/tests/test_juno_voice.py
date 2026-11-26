@@ -29,6 +29,7 @@ from top.juno.adsr_model import AdsrModel, attack_inc_for_time, eps_for_time
 from top.juno.juno_fx import JunoFx
 from top.juno.juno_glide import GlideModel, JunoGlide, glide_coef, glide_time
 from top.juno.juno_tracker import JunoVoiceTracker
+from top.juno import juno_output as out_stage
 from tiliqua.midi.types import Status
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
@@ -271,13 +272,14 @@ class JunoVoiceTests(unittest.TestCase):
 
     def test_juno_fx_matches_model(self):
         """JunoFx (HPF + chorus) gateware is bit-exact with FxModel: tones + noise,
-        all HPF positions and chorus modes (incl. off) switched during the run."""
+        all HPF positions and chorus modes (incl. off) switched during the run; the
+        second half runs at 6x level (18-bit input headroom, output clamp)."""
         rng = random.Random(3)
         n = 1600
         t = np.arange(n) / FS
         x = (0.3 * np.sin(2 * np.pi * 110 * t) + 0.2 * np.sin(2 * np.pi * 1700 * t)
              + 0.05 * np.array([rng.uniform(-1, 1) for _ in range(n)]))
-        xs = [int(v * 32768) for v in x]
+        xs = [int(v * 32768 * (1 if i < n // 2 else 6)) for i, v in enumerate(x)]
         modes = [((i // 200) % 4, (i // 400) % 4) for i in range(n)]   # (hpf, chorus)
         m = Module()
         m.submodules.dut = dut = JunoFx(PipelinedMAC())
@@ -287,7 +289,7 @@ class JunoVoiceTests(unittest.TestCase):
             for v, (hpf, cho) in zip(xs, modes):
                 ctx.set(dut.hpf_mode, hpf)
                 ctx.set(dut.chorus_mode, cho)
-                await stream.put(ctx, dut.i, fixed.Const(v / 32768, shape=ASQ))
+                await stream.put(ctx, dut.i, fixed.Const(v / 32768, shape=LADDER_X_SQ))
                 o = await stream.get(ctx, dut.o)
                 got.append((round(o[0].as_float() * 32768), round(o[1].as_float() * 32768)))
 
@@ -571,6 +573,36 @@ class JunoVoiceTests(unittest.TestCase):
         self.assertEqual(states[2], [(64, 1)] * 6)   # released key not sounding
         self.assertEqual(states[3], [(64, 0)] * 6)
         self.assertEqual(sum(1 for s in states[4] if s == (67, 1)), 1)
+
+    def test_output_knee(self):
+        """Output limiter curve: linear (slope 2) up to the knee, smooth slope at
+        the knee, monotonic, flat at the clipped input (pre-VCA clip inaudible)."""
+        xs = np.linspace(0, 1, 4001)
+        y = np.array([out_stage.knee(x) for x in xs])
+        lin = xs <= out_stage.KNEE / 2
+        self.assertLess(np.abs(y[lin] - 2 * xs[lin]).max(), 1e-9)
+        dy = np.diff(y) / np.diff(xs)
+        self.assertTrue(np.all(dy >= 0))
+        self.assertLess(np.abs(np.diff(dy)).max(), 0.01)    # no slope jump at the knee
+        self.assertGreater(y[-1], 0.999)
+        self.assertLess(dy[-1], 0.01)
+        self.assertEqual(out_stage.knee(-0.4), -out_stage.knee(0.4))
+
+    def test_output_level(self):
+        """Default level (drive off), velocity 0.75: a 6-voice default chord peaks
+        near the knee (~5 V), a single note stays linear (~1.6 V); drive adds
+        saturation without a big level jump."""
+        p = Params(sustain=1.0)
+        one = render([Note(0, 48, 0.0, 0.5, velocity=0.75)], 0.4, p)[int(0.2 * FS):]
+        chord = render([Note(v, n, 0.0, 0.5, velocity=0.75)
+                        for v, n in enumerate([48, 52, 55, 60, 64, 67])], 0.4, p)[int(0.2 * FS):]
+        o1, o6 = out_stage.output(one), out_stage.output(chord)
+        self.assertTrue(0.15 < np.abs(o1).max() < 0.25)
+        self.assertTrue(0.55 < np.abs(o6).max() < 0.72)
+        # single note is in the linear range: output = 8 * pre_gain * core
+        self.assertLess(np.abs(o1).max(), out_stage.KNEE)
+        od = out_stage.output(chord, drive_knob=1.0)
+        self.assertLess(abs(20 * np.log10(rms(od) / rms(o6))), 4.0)
 
     def test_pitch_full_range(self):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the

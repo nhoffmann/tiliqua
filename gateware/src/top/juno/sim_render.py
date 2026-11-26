@@ -325,6 +325,11 @@ def main():
     parser.add_argument("--seconds", type=float, default=0.5)
     parser.add_argument("--out", default="build/juno_sim")
     parser.add_argument("--engine", choices=["vl", "amaranth"], default="vl")
+    parser.add_argument("--raw", action="store_true",
+                        help="write the JunoCore output (default: through the output "
+                             "stage of top.py, juno_output.output, like the jacks)")
+    parser.add_argument("--level", type=float, default=None, help="output level knob 0..1")
+    parser.add_argument("--drive", type=float, default=0.0, help="output drive knob 0..1")
     parser.add_argument("scenes", nargs="*", default=list(SCENES))
     args = parser.parse_args()
     if args.engine == "vl":
@@ -336,6 +341,10 @@ def main():
         t0 = time.time()
         notes, params = SCENES[name]
         audio = engine(notes(args.seconds), args.seconds, params)
+        if not args.raw:
+            from top.juno import juno_output
+            level = juno_output.LEVEL_DEFAULT if args.level is None else args.level
+            audio = juno_output.output(audio, level, args.drive)
         path = os.path.join(args.out, f"{name}.wav")
         write_wav(path, audio)
         print(f"{path}: {len(audio)} samples, peak {np.abs(audio).max():.3f}, "

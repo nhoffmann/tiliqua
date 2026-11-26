@@ -66,7 +66,7 @@ then distortion (drive).
                                   │ Chorus  │ (`chorus` setting, mono -> stereo)
                                   └────┬────┘
                                   ┌────▼────┐
-                                  │  Drive  │ (`drive` setting)
+                                  │ Output  │ (`level`, `drive`: soft limiter)
                                   └────┬────┘
                                   ┌────┴───┐
                                   │Audio   │
@@ -117,8 +117,9 @@ can also be used to control most of these through CCs as follows:
         ENV     sustain       32  envelope sustain
         ENV     release       33  envelope release
 
-        EFFECT  drive         40  distortion amount
-        EFFECT  chorus        41  chorus off / I / II / I+II (stereo from the mono voice sum)
+        FX      chorus        41  chorus off / I / II / I+II (stereo from the mono voice sum)
+        FX      level          7  output level (clean up to ~5 V, soft limit above)
+        FX      drive         40  extra gain into the limiter (0 = off, clean Juno)
 
         MISC    cc-highlight   -  highlight changed on CC input
         MISC    midi-ch        -  filter MIDI to specific channel (default: all)
@@ -157,6 +158,7 @@ from tiliqua.tiliqua_soc import TiliquaSoc
 from juno_voice import MultiADSR, PitchToInc
 from juno_core import JunoCore
 from juno_tracker import JunoVoiceState, JunoVoiceTracker
+from juno_output import knee
 
 class PolySynth(wiring.Component):
 
@@ -167,7 +169,8 @@ class PolySynth(wiring.Component):
 
     i_midi: In(stream.Signature(midi.MidiMessage))
 
-    drive: In(unsigned(16))
+    drive: In(unsigned(16))       # output pre-gain (level x drive, juno_output)
+    out_gain: In(unsigned(16), init=65535)   # output post-gain UQ(0,16) (drive compensation)
     reso: In(unsigned(16))
     env_amt: In(ASQ)
     attack_rate: In(unsigned(32))
@@ -301,21 +304,23 @@ class PolySynth(wiring.Component):
             voice_block.lfo_vcf_depth.eq(self.lfo_vcf_depth),
         ]
 
-        # JunoCore stereo output (HPF + chorus inside) -> drive
+        # JunoCore stereo output (HPF + chorus inside) -> output stage (juno_output):
+        # pre-gain (level x drive) -> soft-knee limiter LUT -> post-gain
         m.submodules.vb_split2 = vb_split2 = dsp.Split(n_channels=2, source=voice_block.o)
-
-        def scaled_tanh(x):
-            return math.tanh(3.0*x)
+        post_gain = Signal(dsp.mac.SQNative)
+        m.d.comb += post_gain.as_value().eq(self.out_gain >> 1)
 
         m.submodules.mac_server = mac_server = dsp.mac.RingMACServer()
 
         outs = []
         for lr in [0, 1]:
             vca = dsp.VCA(macp=mac_server.new_client())
-            waveshaper = dsp.WaveShaper(lut_function=scaled_tanh,
+            waveshaper = dsp.WaveShaper(lut_function=knee,
                                         macp=mac_server.new_client())
+            post = dsp.VCA(macp=mac_server.new_client())
             setattr(m.submodules, f"out_gainvca_{lr}", vca)
             setattr(m.submodules, f"out_waveshaper_{lr}", waveshaper)
+            setattr(m.submodules, f"out_postvca_{lr}", post)
 
             dsp.connect_remap(m, vb_split2.o[lr], vca.i, lambda o, i : [
                 i.payload[0].eq(o.payload<<2),
@@ -323,7 +328,11 @@ class PolySynth(wiring.Component):
             ])
 
             wiring.connect(m, vca.o, waveshaper.i)
-            outs.append(waveshaper.o)
+            dsp.connect_remap(m, waveshaper.o, post.i, lambda o, i : [
+                i.payload[0].eq(o.payload),
+                i.payload[1].eq(post_gain)
+            ])
+            outs.append(post.o)
 
         # Final outputs on channel 2, 3
         m.submodules.merge4 = merge4 = dsp.Merge(
@@ -337,6 +346,9 @@ class PolySynth(wiring.Component):
 class SynthPeripheral(wiring.Component):
 
     class Drive(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(16))
+
+    class OutGain(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
 
     class Reso(csr.Register, access="w"):
@@ -454,6 +466,7 @@ class SynthPeripheral(wiring.Component):
         self._lfo_depths    = regs.add("lfo_depths",    self.LfoDepths(),     offset=voices_csr_end + 0x60)
         self._glide         = regs.add("glide",         self.Glide(),         offset=voices_csr_end + 0x64)
         self._voice_cfg     = regs.add("voice_cfg",     self.VoiceCfg(),      offset=voices_csr_end + 0x68)
+        self._out_gain      = regs.add("out_gain",      self.OutGain(),       offset=voices_csr_end + 0x6C)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -472,6 +485,8 @@ class SynthPeripheral(wiring.Component):
         # top-level tweakables
         with m.If(self._drive.f.value.w_stb):
             m.d.sync += self.synth.drive.eq(self._drive.f.value.w_data)
+        with m.If(self._out_gain.f.value.w_stb):
+            m.d.sync += self.synth.out_gain.eq(self._out_gain.f.value.w_data)
         with m.If(self._reso.f.value.w_stb):
             m.d.sync += self.synth.reso.eq(self._reso.f.value.w_data)
         with m.If(self._env_amt.f.value.w_stb):

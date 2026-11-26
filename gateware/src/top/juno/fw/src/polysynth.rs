@@ -38,8 +38,14 @@ impl Polysynth0 {
         self.registers.fx().write(|w| unsafe { w.hpf().bits(hpf).chorus().bits(chorus) } );
     }
 
+    /// Output pre-gain (level x drive) * 8192 (gateware: `drive << 2`, SQ(3,15)).
     pub fn set_drive(&mut self, value: u16)  {
         self.registers.drive().write(|w| unsafe { w.value().bits(value) } );
+    }
+
+    /// Output post-gain, UQ(0,16).
+    pub fn set_out_gain(&mut self, value: u16)  {
+        self.registers.out_gain().write(|w| unsafe { w.value().bits(value) } );
     }
 
     pub fn set_reso(&mut self, value: u16)  {

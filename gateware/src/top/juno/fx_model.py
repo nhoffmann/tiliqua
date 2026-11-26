@@ -89,7 +89,7 @@ class FxModel:
         return lp, sat(lp + v)
 
     def sample(self, x, hpf_mode=HPF_FLAT, chorus_mode=CHORUS_OFF):
-        """x: mono voice sum (ASQ raw). Returns (left, right) ASQ raw."""
+        """x: mono voice sum (SQNative raw, +-4). Returns (left, right) ASQ raw."""
         # HPF
         lp, self.hpf_s = self._onepole(HPF_G[hpf_mode], x, self.hpf_s)
         if hpf_mode == 0:

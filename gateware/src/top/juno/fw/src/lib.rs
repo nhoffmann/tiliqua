@@ -15,6 +15,7 @@ pub mod dco;
 pub mod lfo;
 pub mod glide;
 pub mod variance;
+pub mod out;
 pub mod vcf;
 pub mod env;
 

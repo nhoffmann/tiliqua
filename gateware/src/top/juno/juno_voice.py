@@ -1023,14 +1023,19 @@ class VoiceMixer(wiring.Component):
     Sum N voices to mono (Juno: the stereo image comes from the chorus only).
     Each voice is scaled by 0.75 * 2 / N (polysyn's per-side gain, now summed),
     the sum saturates instead of wrapping.
+
+    Phase 4.7: the output is ``osq`` (``JunoVoice``: 18-bit ``SQNative``, +-4), so a
+    full-mix 6-voice chord (peaks ~1.4) reaches the HPF / chorus unclipped; the only
+    clamp to +-1 is at the ``JunoFx`` output.
     """
 
-    def __init__(self, n, sq=ASQ):
+    def __init__(self, n, sq=ASQ, osq=None):
         self.n = n
         self.sq = sq
+        self.osq = osq or sq
         super().__init__({
             "i": In(stream.Signature(Block(sq))),
-            "o": Out(stream.Signature(sq)),
+            "o": Out(stream.Signature(self.osq)),
         })
 
     def elaborate(self, platform):
@@ -1059,7 +1064,7 @@ class VoiceMixer(wiring.Component):
             with m.State('EMIT-OUTPUT'):
                 m.d.comb += [
                     self.o.valid.eq(1),
-                    self.o.payload.eq(acc.saturate(sq)),
+                    self.o.payload.eq(acc.saturate(self.osq)),
                 ]
                 with m.If(self.o.ready):
                     m.next = 'CLEAR'
@@ -1073,8 +1078,9 @@ class JunoVoice(wiring.Component):
         self.n_voices = n_voices
         self.sq = sq
         super().__init__({
-            # Mono voice sum (stereo comes from the chorus in JunoCore / JunoFx)
-            "o": Out(stream.Signature(sq)),
+            # Mono voice sum (stereo comes from the chorus in JunoCore / JunoFx),
+            # 18 bit (+-4) headroom into the effects
+            "o": Out(stream.Signature(mac.SQNative)),
 
             # Voice control (from MidiVoiceTracker)
             "voice_gates":     In(data.ArrayLayout(unsigned(1), self.n_voices)),
@@ -1122,7 +1128,7 @@ class JunoVoice(wiring.Component):
         m.submodules.merge = merge = BlockMerge({"x": mac.SQNative, "env": MultiADSR.EnvUQ})
         # Juno 4-pole ladder (layer 1) with cutoff path, DC block, VCA, Gate mode
         m.submodules.svf = svf = MultiLadder(n=N, sq=sq, macp=PipelinedMAC())
-        m.submodules.mixer = mixer = VoiceMixer(n=N, sq=sq)
+        m.submodules.mixer = mixer = VoiceMixer(n=N, sq=sq, osq=mac.SQNative)
 
         # Wire external ports -> internal components
         for n in range(N):

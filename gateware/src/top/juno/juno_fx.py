@@ -41,7 +41,7 @@ class JunoFx(wiring.Component):
         """``macp``: a ``juno_voice.PipelinedMAC`` (passed in, see ``JunoLfo``)."""
         self.macp = macp
         super().__init__({
-            "i":           In(stream.Signature(ASQ)),
+            "i":           In(stream.Signature(mac.SQNative)),   # +-4 headroom (4.7)
             "o":           Out(stream.Signature(data.ArrayLayout(ASQ, 2))),
             "hpf_mode":    In(2),     # 0 bass boost, 1 flat, 2 240 Hz, 3 720 Hz
             "chorus_mode": In(2),     # 0 off, 1 I, 2 II, 3 I+II

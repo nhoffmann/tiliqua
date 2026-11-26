@@ -36,6 +36,7 @@ use tiliqua_fw::dco;
 use tiliqua_fw::lfo;
 use tiliqua_fw::glide;
 use tiliqua_fw::variance;
+use tiliqua_fw::out;
 use tiliqua_fw::vcf;
 use tiliqua_fw::env;
 
@@ -116,8 +117,12 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         // Update synthesizer
         //
 
-        let drive_smooth = app.drive_smoother.proc_u16(opts.effect.drive.value);
-        app.synth.set_drive(drive_smooth);
+        // Output stage: level x drive pre-gain, drive-compensating post-gain
+        let (pre, post) = out::registers(opts.effect.level.value, opts.effect.drive.value);
+        let pre = app.drive_smoother.proc_u16(pre);
+        let post = app.out_gain_smoother.proc_u16(post);
+        app.synth.set_drive(pre);
+        app.synth.set_out_gain(post);
 
         // Map 0-1 UI range to 32768-8192 hardware range (inverted)
         // Ladder resonance: knob -> KR-106-calibrated curve (gateware: k = 4.5 res)
@@ -253,6 +258,7 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(35, global_index(opts, &opts.adsr.vca_mode), CcMapMode::Absolute);
     // Effect page (CC 40-41)
     m.add(40, global_index(opts, &opts.effect.drive),    CcMapMode::Absolute);
+    m.add(7,  global_index(opts, &opts.effect.level),    CcMapMode::Absolute);
     m.add(41, global_index(opts, &opts.effect.chorus),   CcMapMode::Absolute);
     m
 }
@@ -265,6 +271,7 @@ struct App {
     ui: Ui,
     synth: Polysynth0,
     drive_smoother: OnePoleSmoother,
+    out_gain_smoother: OnePoleSmoother,
     reso_smoother: OnePoleSmoother,
     cutoff_smoother: OnePoleSmoother,
     // last mod wheel (CC1) value, 0..127
@@ -284,6 +291,7 @@ struct App {
 impl App {
     pub fn new(ui: Ui, mut synth: Polysynth0) -> Self {
         let drive_smoother = OnePoleSmoother::new(0.05f32);
+        let out_gain_smoother = OnePoleSmoother::new(0.05f32);
         let reso_smoother = OnePoleSmoother::new(0.05f32);
         let cutoff_smoother = OnePoleSmoother::new(0.05f32);
         let cc_mapper = build_cc_mapper(&ui.opts);
@@ -293,6 +301,7 @@ impl App {
             ui,
             synth,
             drive_smoother,
+            out_gain_smoother,
             reso_smoother,
             cutoff_smoother,
             mod_wheel: 0,

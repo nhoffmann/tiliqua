@@ -104,6 +104,11 @@ impl Polysynth0 {
         self.registers.lfo_delay().write(|w| unsafe { w.value().bits(step) } );
     }
 
+    /// Portamento coefficient (`juno_glide`), 0 = off.
+    pub fn set_glide(&mut self, coef: u32)  {
+        self.registers.glide().write(|w| unsafe { w.coef().bits(coef) } );
+    }
+
     /// LFO depths: pitch (1/1024 semitones), cutoff (normalized octaves, 15 bit).
     pub fn set_lfo_depths(&mut self, dco: u16, vcf: u16)  {
         self.registers.lfo_depths().write(|w| unsafe { w.dco().bits(dco).vcf().bits(vcf) } );

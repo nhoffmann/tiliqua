@@ -34,6 +34,7 @@ use static_cell::StaticCell;
 
 use tiliqua_fw::dco;
 use tiliqua_fw::lfo;
+use tiliqua_fw::glide;
 use tiliqua_fw::vcf;
 use tiliqua_fw::env;
 
@@ -170,6 +171,12 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_mix_levels(dco::sub_gain(opts.dco.sub.value),
                                  dco::level_gain(opts.dco.noise.value));
 
+        // Portamento (float conversion only when the knob moves)
+        if app.last_porta != Some(opts.voice.porta.value) {
+            app.last_porta = Some(opts.voice.porta.value);
+            app.synth.set_glide(glide::coef(opts.voice.porta.value));
+        }
+
         // LFO (float conversions only when a knob moves)
         let lfo_knobs = (opts.lfo.rate.value, opts.lfo.delay.value,
                          opts.dco.lfo.value, opts.vcf.lfo.value);
@@ -200,6 +207,8 @@ fn apply_cc_action(opts: &mut Opts, action: &opts::cc_map::CcAction) {
 
 fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     let mut m = MidiCcMapper::new();
+    // VOICE page (CC 5 = MIDI portamento time)
+    m.add(5,  global_index(opts, &opts.voice.porta),     CcMapMode::Absolute);
     // LFO page (CC 24-25)
     m.add(24, global_index(opts, &opts.lfo.rate),        CcMapMode::Absolute);
     m.add(25, global_index(opts, &opts.lfo.delay),       CcMapMode::Absolute);
@@ -248,6 +257,8 @@ struct App {
     last_env_knobs: Option<(u16, u16, u16)>,
     // last LFO knobs written (rate, delay, dco depth, vcf depth)
     last_lfo_knobs: Option<(u16, u16, u16, u16)>,
+    // last portamento knob written
+    last_porta: Option<u16>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
 }
@@ -268,6 +279,7 @@ impl App {
             cutoff_smoother,
             mod_wheel: 0,
             last_lfo_knobs: None,
+            last_porta: None,
             last_env_knobs: None,
             cc_mapper,
         }

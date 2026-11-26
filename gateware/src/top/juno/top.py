@@ -86,9 +86,10 @@ can also be used to control most of these through CCs as follows:
         ────    ─────────     ──  ───────────
         HELP    scroll         -  scroll help text up/down
 
+        VOICE   porta          5  portamento (per-voice glide, 0 = off .. 3 s)
 
-        LFO     rate          24  LFO rate (~0.1 .. 20 Hz)
-        LFO     delay         25  LFO fade-in after a new note (0 .. 1.5 s)
+        LFO     rate          24  LFO rate (0.05 .. 29.5 Hz)
+        LFO     delay         25  LFO fade-in after a new note (0 .. 3.4 s)
 
         DCO     range         15  16' / 8' / 4' (octave)
         DCO     lfo           22  LFO -> pitch (vibrato depth)
@@ -188,6 +189,8 @@ class PolySynth(wiring.Component):
     lfo_delay_step: In(unsigned(32))
     lfo_dco_depth: In(unsigned(16))
     lfo_vcf_depth: In(unsigned(16))
+    # portamento (juno_glide coef, 0 = off)
+    glide_coef: In(unsigned(18))
 
 
     # Jack detection (directly from pmod hardware)
@@ -241,11 +244,10 @@ class PolySynth(wiring.Component):
             # Note-on velocity scales the envelope (VCF + VCA).
             vel_out = Signal(MultiADSR.EnvUQ, name=f"vel_out_{n}")
             m.d.comb += vel_out.eq(fixed.UQ(0, 8)(voice_tracker.o[n].velocity_on))
-            # Log-domain pitch: note + pitch bend (+ LFO vibrato in JunoCore)
+            # Log-domain note pitch = glide target (bend, vibrato, range added
+            # after the glide in JunoCore)
             pitch = Signal(PitchToInc.PitchSQ, name=f"pitch_{n}")
-            m.d.comb += pitch.as_value().eq(
-                (voice_tracker.o[n].note << PitchToInc.FINE_BITS)
-                + (voice_tracker.pitch_bend.as_value() >> BEND_SHIFT))
+            m.d.comb += pitch.as_value().eq(voice_tracker.o[n].note << PitchToInc.FINE_BITS)
             m.d.comb += [
                 self.voice_states[n].eq(voice_tracker.o[n]),
                 self.voice_cutoffs[n].eq(voice_block.voice_cutoffs[n]),
@@ -278,6 +280,8 @@ class PolySynth(wiring.Component):
             voice_block.chorus_mode.eq(self.chorus_mode),
             voice_block.lfo_rate_inc.eq(self.lfo_rate_inc),
             voice_block.lfo_delay_step.eq(self.lfo_delay_step),
+            voice_block.pitch_bend.as_value().eq(voice_tracker.pitch_bend.as_value() >> BEND_SHIFT),
+            voice_block.glide_coef.eq(self.glide_coef),
             voice_block.lfo_dco_depth.eq(self.lfo_dco_depth),
             voice_block.lfo_vcf_depth.eq(self.lfo_vcf_depth),
         ]
@@ -350,6 +354,9 @@ class SynthPeripheral(wiring.Component):
 
     class LfoDelay(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(32))
+
+    class Glide(csr.Register, access="w"):
+        coef: csr.Field(csr.action.W, unsigned(18))
 
     class LfoDepths(csr.Register, access="w"):
         dco: csr.Field(csr.action.W, unsigned(16))
@@ -424,6 +431,7 @@ class SynthPeripheral(wiring.Component):
         self._lfo_rate      = regs.add("lfo_rate",      self.LfoRate(),       offset=voices_csr_end + 0x58)
         self._lfo_delay     = regs.add("lfo_delay",     self.LfoDelay(),      offset=voices_csr_end + 0x5C)
         self._lfo_depths    = regs.add("lfo_depths",    self.LfoDepths(),     offset=voices_csr_end + 0x60)
+        self._glide         = regs.add("glide",         self.Glide(),         offset=voices_csr_end + 0x64)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -476,6 +484,8 @@ class SynthPeripheral(wiring.Component):
             m.d.sync += self.synth.lfo_rate_inc.eq(self._lfo_rate.f.value.w_data)
         with m.If(self._lfo_delay.f.value.w_stb):
             m.d.sync += self.synth.lfo_delay_step.eq(self._lfo_delay.f.value.w_data)
+        with m.If(self._glide.f.coef.w_stb):
+            m.d.sync += self.synth.glide_coef.eq(self._glide.f.coef.w_data)
         with m.If(self._lfo_depths.element.w_stb):
             m.d.sync += [
                 self.synth.lfo_dco_depth.eq(self._lfo_depths.f.dco.w_data),

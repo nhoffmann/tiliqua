@@ -27,6 +27,7 @@ from top.juno.ladder_model import LadderModel
 from top.juno.fx_model import FxModel
 from top.juno.adsr_model import AdsrModel, attack_inc_for_time, eps_for_time
 from top.juno.juno_fx import JunoFx
+from top.juno.juno_glide import GlideModel, JunoGlide, glide_coef, glide_time
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
 from top.juno.sim_render import render as render_amaranth
@@ -437,6 +438,83 @@ class JunoVoiceTests(unittest.TestCase):
                 out = render([Note(0, 69, 0.0, 1.0)], seconds=0.04, params=p)
                 f = estimate_freq(out[len(out) // 4:, 0])
                 self.assertLess(abs(1200 * np.log2(f / expected)), 2.0)
+
+    def test_glide_matches_model(self):
+        """JunoGlide bit-exact vs GlideModel: random note jumps, coef off / slowest /
+        medium / fastest, switching portamento off mid-glide, snap on tiny jumps."""
+        N = 3
+        m = Module()
+        m.submodules.dut = dut = JunoGlide(N)
+        model = GlideModel(N)
+        rng = random.Random(4)
+        coefs = [116, 116, 3000, (1 << 18) - 1, 0, 40000, 1]
+        mismatches = []
+
+        async def testbench(ctx):
+            targets = [60 << 10] * N
+            for frame in range(760):
+                coef = coefs[(frame // 100) % len(coefs)]
+                if frame % 37 == 0:
+                    targets = [rng.randrange(0, 128) << 10 if rng.random() < 0.8
+                               else rng.randrange(-2000, 130 << 10) for _ in range(N)]
+                if frame >= 700:
+                    # tiny jumps at the slowest glide: step rounds to 0 -> snap
+                    coef = 116
+                    if frame % 10 == 0:
+                        targets = [model.pitch(n) + rng.choice([-7, -2, 1, 4]) for n in range(N)]
+                for n in range(N):
+                    ctx.set(dut.target[n].as_value(), targets[n])
+                ctx.set(dut.coef, coef)
+                ctx.set(dut.tick, 1)
+                await ctx.tick()
+                ctx.set(dut.tick, 0)
+                await ctx.tick().repeat(4 * N + 3)
+                model.tick(targets, coef)
+                for n in range(N):
+                    got = ctx.get(dut.pitch[n].as_value())
+                    if got != model.pitch(n):
+                        mismatches.append((frame, n, got, model.pitch(n)))
+
+        sim = Simulator(m)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+        self.assertEqual(mismatches[:5], [])
+
+    def test_glide_coef(self):
+        """Knob curve (cubic, 3 s at full) and coefficient range."""
+        self.assertEqual(glide_coef(glide_time(0.0)), 0)
+        self.assertAlmostEqual(glide_time(1.0), 3.0)
+        self.assertAlmostEqual(glide_time(0.5), 0.375)
+        self.assertEqual(glide_coef(3.0), 117)
+        self.assertEqual(glide_coef(1e-5), (1 << 18) - 1)
+
+    def test_portamento(self):
+        """A4 -> A5 on one voice with a 30 ms glide: log pitch follows
+        12 (1 - exp(-t / tau)) semitones and lands on A5; bend still applies."""
+        tau, jump = 0.03, 0.3   # first note settles (it glides from the C4 power-up state)
+        p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001,
+                   cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0, portamento=tau)
+        notes = [Note(0, 69, 0.0, jump), Note(0, 81, jump, 1.0)]
+        out = render(notes, seconds=jump + 0.3, params=p)[:, 0]
+        # pitch track: period between rising mean crossings of the saw
+        x = out - np.convolve(out, np.ones(200) / 200, "same")
+        i = np.where((x[:-1] < 0) & (x[1:] >= 0))[0]
+        tc = i + x[i] / (x[i] - x[i + 1])
+        t = (tc[:-1] + tc[1:]) / 2 / FS - jump
+        semi = 12 * np.log2(FS / np.diff(tc) / 440.0)
+        sel = (t > 0.003) & (t < 0.25)
+        expected = 12 * (1 - np.exp(-t[sel] / tau))
+        self.assertGreater(sel.sum(), 50)
+        self.assertLess(np.abs(semi[sel] - expected).max(), 0.25)
+        self.assertLess(np.abs(semi[(t > -0.05) & (t < -0.002)]).max(), 0.05)
+        f_end = estimate_freq(out[-int(0.03 * FS):])
+        self.assertLess(abs(1200 * np.log2(f_end / 880.0)), 2.0)
+        # bend is added after the glide (immediate) and still exact
+        p.bend_semitones = 2.0
+        out = render([Note(0, 69, 0.0, 1.0)], seconds=0.3, params=p)[:, 0]
+        f = estimate_freq(out[-int(0.03 * FS):])
+        self.assertLess(abs(1200 * np.log2(f / (440.0 * 2 ** (2 / 12)))), 2.0)
 
     def test_pitch_full_range(self):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the

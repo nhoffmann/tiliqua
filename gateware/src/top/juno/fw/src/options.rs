@@ -7,6 +7,7 @@ use serde_derive::{Serialize, Deserialize};
 pub enum Page {
     #[default]
     Help,
+    Voice,
     Lfo,
     Dco,
     Vcf,
@@ -156,6 +157,14 @@ pub struct HelpOpts {
     pub scroll: IntOption<ScrollParams>,
 }
 
+// Voice / keyboard controls (Juno-106 left-hand panel): portamento (per-voice
+// exponential glide on the note pitch, juno_glide; knob^3 * 3 s, 0 = off).
+#[derive(OptionPage, Clone)]
+pub struct VoiceOpts {
+    #[option(0)]
+    pub porta: IntOption<LevelParams>,
+}
+
 // Juno LFO (JunoLfo): one global triangle LFO with delay (fade-in after a new
 // note). Knobs = Juno-106 sliders, KR-106-measured curves (fw lfo.rs).
 // Pages and option order follow the Juno-106 panel: LFO, DCO, VCF (incl. HPF),
@@ -253,6 +262,8 @@ pub struct Opts {
     pub tracker: ScreenTracker<Page>,
     #[page(Page::Help)]
     pub help: HelpOpts,
+    #[page(Page::Voice)]
+    pub voice: VoiceOpts,
     #[page(Page::Lfo)]
     pub lfo: LfoOpts,
     #[page(Page::Dco)]

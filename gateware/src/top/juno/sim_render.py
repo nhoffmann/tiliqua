@@ -7,7 +7,8 @@ so changes can be listened to (WAV) and checked numerically without hardware.
 
 Sample rate is nominal 48 kHz: the hardware pulls one stereo sample per audio
 frame, here the testbench pulls them as fast as the simulated block produces
-them. Pitch is sent in semitones (note + bend), like the juno top level.
+them. Pitch is sent in semitones (note; bend is a global setting added after the
+portamento), like the juno top level.
 
 Usage (writes WAVs to ``build/juno_sim/``)::
 
@@ -35,6 +36,7 @@ from top.juno.juno_lfo import pw_knob_to_point
 from top.juno.juno_voice import MultiADSR, MultiLadder, PitchToInc
 from top.juno.ladder_model import KBD_REF_NOTE, res_knob_to_reg
 from top.juno.adsr_model import attack_inc_for_time, eps_for_time
+from top.juno.juno_glide import glide_coef
 
 FS = 48000
 N_VOICES = 6
@@ -79,6 +81,7 @@ class Params:
     kbd:     float = 0.5
     mod_wheel: float = 0.0
     bend_semitones: float = 0.0    # pitch bend applied to all notes (top.py: +-2 range)
+    portamento: float = 0.0        # glide time constant in seconds (0 = off, juno_glide)
     cutoff_cv_volts: float = 0.0   # CV in1, 1 V/oct
     # Juno DCO mixer (firmware defaults: saw on, rest off)
     saw:   bool = True
@@ -136,13 +139,15 @@ def prepare(notes, seconds, params=None):
         "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
         "hpf_mode":       params.hpf,
         "dco_range":      params.dco_range,
+        "pitch_bend":     _raw(params.bend_semitones, PitchToInc.PitchSQ),
+        "glide_coef":     glide_coef(params.portamento),
         "chorus_mode":    params.chorus,
     }
     events = []
     for n in notes:
         base = cutoff_base(params.cutoff, params.kbd, n.note, params.mod_wheel)
         on = (int(n.on_s * FS), n.voice, 1,
-              _raw(n.note + params.bend_semitones, PitchToInc.PitchSQ),
+              _raw(n.note, PitchToInc.PitchSQ),
               _raw(n.velocity, EnvUQ),
               _raw(max(-1.0, min(base, 0.99997)), ASQ))
         events.append(on)
@@ -264,6 +269,13 @@ SCENES = {
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),
     "cutoff_bright": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                       Params(cutoff=0.75, env_amt=0.0, kbd=0.5)),
+    # portamento: one voice C3 -> C4 -> G3 -> C3 (time constant 80 ms), then a
+    # two-voice chord moving up a fourth (each voice glides from its own last note)
+    "portamento": (lambda s: [Note(0, n, i * s / 8, (i + 1) * s / 8)
+                              for i, n in enumerate([48, 60, 55, 48])]
+                   + [Note(0, 48, s / 2, s * 0.7), Note(1, 55, s / 2, s * 0.7),
+                      Note(0, 53, s * 0.7, s * 0.95), Note(1, 60, s * 0.7, s * 0.95)],
+                   Params(portamento=0.08, cutoff=0.6, sustain=0.8)),
 }
 
 

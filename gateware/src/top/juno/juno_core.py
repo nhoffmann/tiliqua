@@ -7,7 +7,8 @@ the hardware top level (``top.py``) and the offline renderer (``sim_render.py``)
 - ``JunoFx``: 4-position HPF + BBD-style stereo chorus on the mono sum.
 - ``JunoLfo``: one triangle LFO with delay, ticked once per output frame
   (each handshake on ``o``), routed to:
-  - pitch: ``voice_pitch = voice_pitch_base + vib`` (vibrato, all voices),
+  - pitch: ``voice_pitch = glide(voice_pitch_base) + bend + vib + range``
+    (``JunoGlide`` portamento per voice; bend, vibrato, DCO range immediate),
   - filter: ``cutoff_mod`` (normalized octaves),
   - pulse width: ``pw_point`` (manual or LFO PWM).
 """
@@ -23,10 +24,12 @@ try:
     from juno_voice import JunoVoice, MultiADSR, PipelinedMAC, PitchToInc
     from juno_lfo import JunoLfo
     from juno_fx import JunoFx
+    from juno_glide import JunoGlide, COEF_BITS as GLIDE_COEF_BITS
 except ImportError:
     from top.juno.juno_voice import JunoVoice, MultiADSR, PipelinedMAC, PitchToInc
     from top.juno.juno_lfo import JunoLfo
     from top.juno.juno_fx import JunoFx
+    from top.juno.juno_glide import JunoGlide, COEF_BITS as GLIDE_COEF_BITS
 
 
 class JunoCore(wiring.Component):
@@ -38,11 +41,15 @@ class JunoCore(wiring.Component):
         super().__init__({
             "o": Out(stream.Signature(data.ArrayLayout(sq, 2))),
 
-            # per voice (from the tracker): pitch = note + bend, gate, velocity
+            # per voice (from the tracker): note pitch (glide target), gate, velocity
             "voice_pitch_base": In(data.ArrayLayout(PitchToInc.PitchSQ, n)),
             "voice_gates":      In(data.ArrayLayout(unsigned(1), n)),
             "voice_velocity":   In(data.ArrayLayout(MultiADSR.EnvUQ, n)),
             "voice_cutoff_base": In(data.ArrayLayout(ASQ, n)),
+
+            # global pitch: bend (PitchSQ raw, added after the glide), portamento
+            "pitch_bend": In(PitchToInc.PitchSQ),
+            "glide_coef": In(unsigned(GLIDE_COEF_BITS)),   # 0 = off (juno_glide)
 
             # DCO
             "dco_range":  In(2),              # 0 = 16' (-1 oct), 1 = 8', 2 = 4' (+1 oct)
@@ -88,6 +95,8 @@ class JunoCore(wiring.Component):
         m.submodules.voice = voice = JunoVoice(n_voices=N, sq=self.sq)
         m.submodules.lfo = lfo = JunoLfo(PipelinedMAC())
         m.submodules.fx = fx = JunoFx(PipelinedMAC())
+        m.submodules.glide = glide = JunoGlide(N)
+        m.d.comb += [glide.tick.eq(self.o.valid & self.o.ready), glide.coef.eq(self.glide_coef)]
         m.d.comb += [fx.hpf_mode.eq(self.hpf_mode), fx.chorus_mode.eq(self.chorus_mode)]
 
         # LFO: one update per output frame
@@ -107,13 +116,16 @@ class JunoCore(wiring.Component):
 
         # DCO range: -12 / 0 / +12 semitones (PitchSQ raw = semitones * 1024)
         range_off = Signal(signed(16))
+        pitch_off = Signal(signed(PitchToInc.PitchSQ.as_shape().width + 1))
         m.d.comb += range_off.eq(Mux(self.dco_range == 0, -12 << PitchToInc.FINE_BITS,
                                  Mux(self.dco_range == 2, 12 << PitchToInc.FINE_BITS, 0)))
+        m.d.comb += pitch_off.eq(self.pitch_bend.as_value() + lfo.vib + range_off)
 
         for n in range(N):
             pitch = Signal(PitchToInc.PitchSQ, name=f"pitch_{n}")
             m.d.comb += [
-                pitch.as_value().eq(self.voice_pitch_base[n].as_value() + lfo.vib + range_off),
+                glide.target[n].eq(self.voice_pitch_base[n]),
+                pitch.as_value().eq(glide.pitch[n].as_value() + pitch_off),
                 voice.voice_pitch[n].eq(pitch),
                 voice.voice_gates[n].eq(self.voice_gates[n]),
                 voice.voice_velocity[n].eq(self.voice_velocity[n]),

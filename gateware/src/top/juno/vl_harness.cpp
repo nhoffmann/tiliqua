@@ -83,6 +83,8 @@ int main(int argc, char **argv) {
         {"hpf_mode",       [&](int64_t v) { top->hpf_mode = v; }},
         {"dco_range",      [&](int64_t v) { top->dco_range = v; }},
         {"chorus_mode",    [&](int64_t v) { top->chorus_mode = v; }},
+        {"pitch_bend",     [&](int64_t v) { top->pitch_bend = v & ((1 << PITCH_W) - 1); }},
+        {"glide_coef",     [&](int64_t v) { top->glide_coef = v; }},
     };
 
     long n_samples = 0;

@@ -794,6 +794,28 @@ def archiver_callback(archiver):
     archiver.with_option_storage(size=OPTION_STORAGE_SIZE)
 
 
+def with_fw_features(features):
+    """Build the firmware with extra Cargo features (e.g. ``stack_watch``).
+
+    Upstream ``TiliquaSoc.compile_firmware`` runs ``cargo build`` / ``cargo
+    objcopy`` without features; this wraps its subprocess call at runtime and
+    adds ``--features``. Use via the environment, e.g.::
+
+        JUNO_FW_FEATURES=stack_watch pdm run juno build --hw r5 --name juno_sw --fw-only
+    """
+    import tiliqua.tiliqua_soc as soc
+    real_check_call = soc.subprocess.check_call
+
+    def check_call(cmd, *args, **kwargs):
+        if list(cmd[:2]) in (["cargo", "build"], ["cargo", "objcopy"]):
+            cmd = list(cmd[:2]) + ["--features", features] + list(cmd[2:])
+        return real_check_call(cmd, *args, **kwargs)
+
+    soc.subprocess.check_call = check_call
+
+
 if __name__ == "__main__":
     this_path = os.path.dirname(os.path.realpath(__file__))
+    if os.environ.get("JUNO_FW_FEATURES"):
+        with_fw_features(os.environ["JUNO_FW_FEATURES"])
     top_level_cli(JunoSoc, path=this_path, archiver_callback=archiver_callback)

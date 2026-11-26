@@ -42,6 +42,7 @@ use tiliqua_hal::pmod::EurorackPmod;
 use tiliqua_fw::vcf;
 use tiliqua_fw::env;
 use tiliqua_fw::preset::{self, Action, PresetCtl, PresetStore};
+use embassy_embedded_hal::flash::partition::BlockingPartition;
 
 pub const TICK_PERIOD_MS: u32 = 5;
 
@@ -77,10 +78,23 @@ fn sim_step_pages(opts: &mut Opts) -> bool {
 }
 
 fn tick_handler(app: &Mutex<RefCell<App>>) {
+    #[cfg(feature = "stack_watch")]
+    tiliqua_fw::stack_watch::isr_enter();
+    tick_body(app);
+    #[cfg(feature = "stack_watch")]
+    tiliqua_fw::stack_watch::isr_exit();
+}
+
+#[inline(never)]
+fn tick_body(app: &Mutex<RefCell<App>>) {
 
     critical_section::with(|cs| {
 
         let mut app = app.borrow_ref_mut(cs);
+        // Plain &mut App: lets the option reads below borrow `app.ui.opts` while
+        // `app.synth` etc. are written (disjoint fields), instead of copying all
+        // options (~0.9 KiB) onto the shared stack every tick.
+        let app = &mut *app;
 
         //
         // Update UI and options
@@ -92,7 +106,8 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         if sim_step_pages(&mut app.ui.opts) {
             app.ui.external_modify();
         }
-        let opts = app.ui.opts.clone();
+        let serial_debug = app.ui.opts.misc.serial_debug.value == UsbMidiSerialDebug::On;
+        let cc_highlight = app.ui.opts.misc.cc_highlight.value == CcHighlight::On;
 
         //
         // Check for TRS/USB MIDI traffic
@@ -105,7 +120,13 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         // Drain the whole read FIFO (depth 8) each tick, so fast CC streams
         // (e.g. mod wheel sweeps) aren't dropped.
         for _ in 0..8 {
+            #[cfg(not(feature = "sim_stack"))]
             let midi_word = app.synth.midi_read();
+            #[cfg(feature = "sim_stack")]
+            let midi_word = match tiliqua_fw::sim_stack::midi_read(app.uptime_ms) {
+                0 => app.synth.midi_read(),
+                w => w,
+            };
             if midi_word == 0 {
                 break;
             }
@@ -137,15 +158,15 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
                 }
             }
 
-            // Optionally dump raw MIDI messages out serial port.
-            if opts.misc.serial_debug.value == UsbMidiSerialDebug::On {
-                info!("midi: 0x{:x} 0x{:x} 0x{:x}",
-                      bytes[0], bytes[1], bytes[2]);
+            // Optionally dump raw MIDI messages out the serial port: queued here,
+            // printed by the main loop (no log formatting on the ISR stack).
+            if serial_debug {
+                app.midi_log.push_back(midi_word).ok();
             }
         }
 
         // Highlight the last CC-modified option (once per cycle)
-        if opts.misc.cc_highlight.value == CcHighlight::On {
+        if cc_highlight {
             if let Some(idx) = last_cc_index {
                 app.ui.opts.select_global(idx);
                 app.ui.external_modify();
@@ -155,6 +176,8 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         //
         // Update synthesizer
         //
+
+        let opts = &app.ui.opts;
 
         // CV inputs (fw cv.rs): pitch / cutoff routed in gateware at audio rate,
         // other targets as knob offsets here
@@ -357,6 +380,8 @@ struct App {
     uptime_ms: u32,
     // MIDI program change received (bank / patch already set in the options)
     program_change: bool,
+    // raw MIDI words for the `serial-debug` dump, printed by the main loop
+    midi_log: heapless::Deque<u32, 16>,
 }
 
 impl App {
@@ -383,12 +408,98 @@ impl App {
             cc_mapper,
             uptime_ms: 0,
             program_change: false,
+            midi_log: heapless::Deque::new(),
         }
     }
 }
 
+#[cfg(not(feature = "sim_stack"))]
+type FlashT = SPIFlash0;
+#[cfg(feature = "sim_stack")]
+type FlashT = tiliqua_fw::sim_stack::PsramFlash;
+type FlashPart = BlockingPartition<'static, NoopRawMutex, FlashT>;
+
+// Long-lived objects live in statics instead of `main`'s stack frame. Block RAM
+// (16 KiB) holds data and the one stack shared by the main loop and the tick ISR;
+// as statics these objects have a fixed size at link time and are not duplicated
+// by moves during startup (each move left a copy in `main`'s frame). Each is
+// created by its own `#[inline(never)]` step below, so only one step's
+// temporaries are on the stack at a time.
+
+static FLASH: StaticCell<FlashMutex<NoopRawMutex, RefCell<FlashT>>> = StaticCell::new();
+/// main loop's snapshot of the options (drawing, presets), see `copy_opts`
+static VIEW: StaticCell<Opts> = StaticCell::new();
+static FLASH_PERSIST: StaticCell<Option<FlashOptionsPersistence<FlashPart>>> = StaticCell::new();
+static PRESET_STORE: StaticCell<Option<PresetStore<FlashPart>>> = StaticCell::new();
+/// preset record buffer (load / write / edit buffer)
+static REC: StaticCell<[u8; preset::BLOB_MAX + 8]> = StaticCell::new();
+static APP: StaticCell<Mutex<RefCell<App>>> = StaticCell::new();
+
+/// `*dst = src.clone()` in its own frame: the clone's temporary is freed on
+/// return instead of being inlined into the main loop's frame.
+#[inline(never)]
+fn copy_opts(dst: &mut Opts, src: &Opts) {
+    dst.clone_from(src);
+}
+
+/// Parsed bootinfo (manifest: name, tag, help texts, option window), ~1 KiB.
+static BOOTINFO: StaticCell<bootinfo::BootInfo> = StaticCell::new();
+
+#[inline(never)]
+fn init_bootinfo() -> &'static bootinfo::BootInfo {
+    BOOTINFO.init(unsafe { bootinfo::BootInfo::from_addr(BOOTINFO_BASE) }.expect("invalid bootinfo"))
+}
+
+#[inline(never)]
+fn init_rec() -> &'static mut [u8; preset::BLOB_MAX + 8] {
+    REC.init([0u8; preset::BLOB_MAX + 8])
+}
+
+/// Restore the edit buffer (sound + active location as at power-off) into
+/// `opts`. Without one, keep the sound from the system save and mark it as
+/// `init` (edited).
+#[inline(never)]
+fn restore_edit(opts: &mut Opts, store: &mut Option<PresetStore<FlashPart>>,
+                rec: &mut [u8], default_patch_hash: u32) -> PresetCtl {
+    let (active, snap) = store.as_mut()
+        .and_then(|s| s.load(preset::KEY_EDIT, rec))
+        .and_then(|n| preset::decode_edit(opts, &rec[..n]))
+        .unwrap_or((None, default_patch_hash));
+    if let Some(a) = active {
+        preset::set_location(opts, a);
+    }
+    PresetCtl::new(preset::selected_slot(opts), active, snap, preset::patch_hash(opts))
+}
+
+#[inline(never)]
+fn init_view() -> &'static mut Opts {
+    VIEW.init(Opts::default())
+}
+
+#[inline(never)]
+fn init_flash_persist(flash: &'static FlashMutex<NoopRawMutex, RefCell<FlashT>>,
+                      window: Option<core::ops::Range<u32>>, opts: &mut Opts)
+                      -> &'static mut Option<FlashOptionsPersistence<FlashPart>> {
+    FLASH_PERSIST.init(FlashOptionsPersistence::open_partition(flash, window, opts))
+}
+
+#[inline(never)]
+fn init_preset_store(flash: &'static FlashMutex<NoopRawMutex, RefCell<FlashT>>,
+                     window: Option<core::ops::Range<u32>>)
+                     -> &'static mut Option<PresetStore<FlashPart>> {
+    PRESET_STORE.init(PresetStore::open_partition(flash, window))
+}
+
+#[inline(never)]
+fn init_app(opts: &Opts, make_ui: impl FnOnce(Opts) -> Ui, synth: Synth)
+            -> &'static Mutex<RefCell<App>> {
+    APP.init(Mutex::new(RefCell::new(App::new(make_ui(opts.clone()), synth))))
+}
+
 #[entry]
 fn main() -> ! {
+    #[cfg(feature = "stack_watch")]
+    tiliqua_fw::stack_watch::paint();
     let peripherals = pac::Peripherals::take().expect("unable to take peripherals");
     let serial = Serial0::new(peripherals.UART0);
     let mut persist = Persist0::new(peripherals.PERSIST_PERIPH);
@@ -401,8 +512,8 @@ fn main() -> ! {
 
     info!("Hello from Tiliqua JUNO!");
 
-    let bootinfo = unsafe { bootinfo::BootInfo::from_addr(BOOTINFO_BASE) }.expect("invalid bootinfo");
-    let modeline = bootinfo.modeline.maybe_override_fixed(
+    let bootinfo = init_bootinfo();
+    let modeline = bootinfo.modeline.clone().maybe_override_fixed(
         FIXED_MODELINE, CLOCK_DVI_HZ);
     let mut display = hal::new_framebuffer!(peripherals, modeline.clone());
 
@@ -411,31 +522,19 @@ fn main() -> ! {
     calibration::CalibrationConstants::load_or_default(&mut i2c1, &mut pmod);
 
     //
-    // Create options and maybe load from persistent storage
+    // Option storage (system options + presets behind them, preset.rs)
     //
 
-    let mut opts = Opts::default();
-    let default_patch_hash = preset::patch_hash(&opts);
-    let flash = FlashMutex::<NoopRawMutex, _>::new(RefCell::new(spiflash));
-    // Option storage window: upstream system options first, presets behind (preset.rs)
-    let (system_window, preset_window) =
-        preset::split_window(bootinfo.manifest.get_option_storage_window());
-    let mut flash_persist_opt = FlashOptionsPersistence::open_partition(
-        &flash, system_window, &mut opts);
-    let mut preset_store = PresetStore::open_partition(&flash, preset_window);
-
-    // Restore the edit buffer (sound + active location as at power-off). Without
-    // one, keep the sound from the system save and mark it as `init` (edited).
-    let mut rec = [0u8; preset::BLOB_MAX + 8];
-    let (active, snap) = preset_store.as_mut()
-        .and_then(|s| s.load(preset::KEY_EDIT, &mut rec))
-        .and_then(|n| preset::decode_edit(&mut opts, &rec[..n]))
-        .unwrap_or((None, default_patch_hash));
-    if let Some(a) = active {
-        preset::set_location(&mut opts, a);
-    }
-    let mut preset_ctl = PresetCtl::new(preset::selected_slot(&opts), active, snap,
-                                        preset::patch_hash(&opts));
+    #[cfg(not(feature = "sim_stack"))]
+    let (flash, window) = (FLASH.init(FlashMutex::new(RefCell::new(spiflash))),
+                           bootinfo.manifest.get_option_storage_window());
+    // Simulation: option storage in PSRAM (sim_stack.rs)
+    #[cfg(feature = "sim_stack")]
+    let (flash, window) = {
+        let _ = spiflash;
+        (FLASH.init(FlashMutex::new(RefCell::new(tiliqua_fw::sim_stack::PsramFlash::new()))),
+         Some(tiliqua_fw::sim_stack::WINDOW))
+    };
 
     //
     // Configure TUSB322 (CC controller) in DFP/Host mode
@@ -458,11 +557,26 @@ fn main() -> ! {
 
     palette::ColorPalette::default().write_to_hardware(&mut display);
 
-    let ui = ui::UI::new(opts, TICK_PERIOD_MS, Encoder0::new(peripherals.ENCODER0),
-                         Pca9635Driver::new(I2cDevice::new(i2c0)), pmod);
-    let app = Mutex::new(RefCell::new(App::new(ui, Synth::new(peripherals.SYNTH_PERIPH))));
+    let encoder = Encoder0::new(peripherals.ENCODER0);
+    let pca9635 = Pca9635Driver::new(I2cDevice::new(i2c0));
+    let synth = Synth::new(peripherals.SYNTH_PERIPH);
+    // Options: defaults, then the system save, then the edit buffer.
+    let opts = init_view();
+    let default_patch_hash = preset::patch_hash(opts);
+    #[cfg(feature = "sim_stack")]
+    if tiliqua_fw::sim_stack::MIDI_LOG {
+        opts.misc.serial_debug.value = UsbMidiSerialDebug::On;
+    }
+    // Option storage window: upstream system options first, presets behind (preset.rs)
+    let (system_window, preset_window) = preset::split_window(window);
+    let flash_persist_opt = init_flash_persist(flash, system_window, opts);
+    let preset_store = init_preset_store(flash, preset_window);
+    let rec = init_rec();
+    let mut preset_ctl = restore_edit(opts, preset_store, rec, default_patch_hash);
+    let app = init_app(opts,
+        |opts| ui::UI::new(opts, TICK_PERIOD_MS, encoder, pca9635, pmod), synth);
 
-    handler!(tick_isr = || tick_handler(&app));
+    handler!(tick_isr = || tick_handler(app));
 
     irq::scope(|s| {
 
@@ -478,9 +592,12 @@ fn main() -> ! {
 
         loop {
 
-            let (mut opts, notes, cutoffs, draw_options, save_opts, wipe_opts,
+            let (notes, cutoffs, draw_options, save_opts, wipe_opts,
                  preset_write, preset_init, program_change, now) = critical_section::with(|cs| {
                 let mut app = app.borrow_ref_mut(cs);
+                // Snapshot of the options for this iteration (drawing, presets)
+                // into the persistent buffer: no Opts temporaries on the stack.
+                copy_opts(opts, &app.ui.opts);
                 let save_opts = app.ui.opts.misc.save_opts.poll();
                 let wipe_opts = app.ui.opts.misc.wipe_opts.poll();
                 let preset_write = app.ui.opts.preset.write.poll();
@@ -538,8 +655,7 @@ fn main() -> ! {
                 // Copy out all the bits of state we need for drawing
                 //
 
-                (app.ui.opts.clone(),
-                 app.synth.voice_notes(),
+                (app.synth.voice_notes(),
                  app.synth.voice_cutoffs(),
                  app.ui.draw(),
                  save_opts,
@@ -550,9 +666,37 @@ fn main() -> ! {
                  now)
             });
 
+            #[cfg(feature = "sim_stack")]
+            let (preset_write, preset_init, save_opts, wipe_opts) = {
+                use tiliqua_fw::sim_stack::Event;
+                let mut v = (preset_write, preset_init, save_opts, wipe_opts);
+                match tiliqua_fw::sim_stack::event(now) {
+                    Some(Event::Write) => v.0 = true,
+                    Some(Event::Init) => v.1 = true,
+                    Some(Event::SaveOpts) => v.2 = true,
+                    Some(Event::WipeOpts) => v.3 = true,
+                    Some(Event::Slot(slot)) => {
+                        critical_section::with(|cs| {
+                            preset::set_location(&mut app.borrow_ref_mut(cs).ui.opts, slot);
+                        });
+                        preset::set_location(&mut *opts, slot);
+                    }
+                    None => {}
+                }
+                v
+            };
+
+            // MIDI dump (MISC serial-debug), queued by the tick ISR
+            let midi_words = critical_section::with(|cs| {
+                core::mem::take(&mut app.borrow_ref_mut(cs).midi_log)
+            });
+            for w in midi_words.iter() {
+                info!("midi: 0x{:x} 0x{:x} 0x{:x}", w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF);
+            }
+
             if save_opts {
                 if let Some(ref mut flash_persist) = flash_persist_opt {
-                    if let Err(e) = flash_persist.save_options(&opts) {
+                    if let Err(e) = flash_persist.save_options(&*opts) {
                         error!("failed to save options: {e:?}");
                     }
                 }
@@ -577,6 +721,8 @@ fn main() -> ! {
 
             let sel = preset::selected_slot(&opts);
             let on_preset_page = opts.tracker.page.value == Page::Preset;
+            #[cfg(feature = "sim_stack")]
+            let on_preset_page = { let _ = on_preset_page; true };  // pages step on their own
             // Loads / init are applied in place (no `Opts` copies: data and both
             // stacks share 16 KiB block RAM), then mirrored into the local copy.
             let apply = |ctl: &mut PresetCtl, rec: Option<&[u8]>, active: Option<u8>, opts: &mut Opts| -> bool {
@@ -594,15 +740,15 @@ fn main() -> ! {
             };
             match preset_ctl.step(now, sel, on_preset_page, preset_write, preset_init, program_change) {
                 Action::Load(slot) => {
-                    let n = preset_store.as_mut().and_then(|s| s.load(slot as u32, &mut rec));
-                    let ok = apply(&mut preset_ctl, n.map(|n| &rec[..n]), Some(slot), &mut opts);
+                    let n = preset_store.as_mut().and_then(|s| s.load(slot as u32, rec));
+                    let ok = apply(&mut preset_ctl, n.map(|n| &rec[..n]), Some(slot), &mut *opts);
                     info!("preset: load {}{}", preset::slot_name(slot), if ok { "" } else { " (empty)" });
                 }
                 Action::Init => {
-                    apply(&mut preset_ctl, None, None, &mut opts);
+                    apply(&mut preset_ctl, None, None, &mut *opts);
                 }
                 Action::Write(slot) => {
-                    let ok = match (preset_store.as_mut(), preset::encode(&opts, &mut rec)) {
+                    let ok = match (preset_store.as_mut(), preset::encode(&opts, rec)) {
                         (Some(s), Some(n)) => s.save(slot as u32, &rec[..n]),
                         _ => false,
                     };
@@ -617,7 +763,7 @@ fn main() -> ! {
                     critical_section::with(|cs| {
                         preset::set_location(&mut app.borrow_ref_mut(cs).ui.opts, slot);
                     });
-                    preset::set_location(&mut opts, slot);
+                    preset::set_location(&mut *opts, slot);
                 }
                 Action::None => {}
             }
@@ -631,11 +777,22 @@ fn main() -> ! {
             }
             if preset_ctl.autosave_due(now, patch_hash) {
                 if let Some(s) = preset_store.as_mut() {
-                    if let Some(n) = preset::encode_edit(&opts, preset_ctl.active, preset_ctl.snap(), &mut rec) {
+                    if let Some(n) = preset::encode_edit(&opts, preset_ctl.active, preset_ctl.snap(), rec) {
                         s.save(preset::KEY_EDIT, &rec[..n]);
                     }
                 }
                 preset_ctl.autosaved(patch_hash);   // also on failure: no retry storm
+                #[cfg(feature = "sim_stack")]
+                info!("sim_stack: t={}ms autosave", now);
+            }
+
+            #[cfg(feature = "stack_watch")]
+            {
+                tiliqua_fw::stack_watch::scan();
+                #[cfg(not(feature = "sim_stack"))]
+                tiliqua_fw::stack_watch::report(now, 10_000);
+                #[cfg(feature = "sim_stack")]
+                tiliqua_fw::stack_watch::report(now, 100);
             }
 
             let on_help_page = opts.tracker.page.value == Page::Help;
@@ -646,7 +803,7 @@ fn main() -> ! {
                 } else {
                     (h_active/2-30, 70)
                 };
-                draw::draw_options(&mut display, &opts, x, y,
+                draw::draw_options(&mut display, &*opts, x, y,
                                    HUE).ok();
                 draw::draw_name(&mut display, h_active/2, v_active-50, HUE,
                                 &bootinfo.manifest.name, &bootinfo.manifest.tag, &modeline).ok();

@@ -6,7 +6,8 @@ pub use tiliqua_hal as hal;
 
 hal::impl_tiliqua_soc_pac!();
 
-tiliqua_lib::impl_handlers!(Serial0);
+// Own handlers (critical-section logger), see handlers.rs
+pub mod handlers;
 tiliqua_lib::impl_tick!(Clint);
 
 pub mod options;
@@ -20,5 +21,10 @@ pub mod out;
 pub mod cv;
 pub mod vcf;
 pub mod env;
+
+#[cfg(feature = "stack_watch")]
+pub mod stack_watch;
+#[cfg(feature = "sim_stack")]
+pub mod sim_stack;
 
 pub use synth::Synth;

@@ -43,6 +43,11 @@ serde_derive = "1.0.219"
 [features]
 # Simulation only: step through the menu pages (see sim_ui.py).
 sim_pages = []
+# Stack high-water measurement, logged on the serial port (stack_watch.rs); also on hardware.
+stack_watch = []
+# Simulation only: stack_watch + scripted MIDI / preset / option activity and a
+# PSRAM-backed option storage (sim_stack.rs); run with `sim_ui.py --features sim_stack`.
+sim_stack = ["sim_pages", "stack_watch"]
 
 [profile.release]
 codegen-units = 1

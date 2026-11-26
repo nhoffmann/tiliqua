@@ -24,6 +24,8 @@ All audio-rate values use 15 fractional bits (32768 = 1.0). ``JunoLfoModel`` is 
 bit-exact Python model; ``tests/test_juno_voice.py`` checks the gateware against it.
 """
 
+import math
+
 from amaranth import *
 from amaranth.lib import wiring
 from amaranth.lib.memory import Memory
@@ -52,6 +54,48 @@ def pw_knob_to_point(knob):
 def pw_curve_lut():
     n = 1 << PW_LUT_BITS
     return [pw_knob_to_point(i / (n - 1)) for i in range(n)]
+
+
+# Knob (= Juno-106 slider / 127) -> LFO settings, measured on the KR-106
+# (tools/kr106_compare.py --lfo; pitch tracking of a C5 saw, crossings of the
+# vibrato curve for the rate, 2.5 / 97.5 % for the depth). Slider 0 rate is too
+# slow to measure in our renders and set to 0.05 Hz. Delay values are the time to
+# reach 95 % depth; our fade-in is linear, so its full time is that / 0.95.
+# Same tables in firmware fw/src/lfo.rs.
+LFO_SLIDERS = [0, 16, 32, 48, 64, 80, 96, 112, 127]
+LFO_RATE_HZ = [0.05, 1.28, 2.36, 3.47, 4.54, 6.56, 8.44, 14.77, 29.52]     # log-interpolated
+LFO_DCO_SEMI = [0.0, 0.12, 0.21, 0.41, 0.51, 0.64, 0.71, 1.30, 3.80]       # vibrato, peak
+LFO_VCF_OCT = [0.0, 0.42, 0.84, 1.24, 1.60, 1.92, 2.15, 2.32, 2.42]        # cutoff, peak
+LFO_DELAY95_S = [0.0, 0.20, 0.30, 0.48, 0.65, 1.00, 1.43, 2.30, 3.38]      # to 95 % depth
+
+
+def lfo_table(knob, table, log=False):
+    sl = min(max(knob, 0.0), 1.0) * 127
+    i = 0
+    while i < len(LFO_SLIDERS) - 2 and sl > LFO_SLIDERS[i + 1]:
+        i += 1
+    f = (sl - LFO_SLIDERS[i]) / (LFO_SLIDERS[i + 1] - LFO_SLIDERS[i])
+    a, b = table[i], table[i + 1]
+    if log:
+        return math.exp(math.log(a) + f * (math.log(b) - math.log(a)))
+    return a + f * (b - a)
+
+
+def lfo_rate_hz(knob):
+    return lfo_table(knob, LFO_RATE_HZ, log=True)
+
+
+def lfo_dco_semitones(knob):
+    return lfo_table(knob, LFO_DCO_SEMI)
+
+
+def lfo_vcf_octaves(knob):
+    return lfo_table(knob, LFO_VCF_OCT)
+
+
+def lfo_delay_full_s(knob):
+    """Full fade-in time of our linear delay (measured 95 % time / 0.95)."""
+    return lfo_table(knob, LFO_DELAY95_S) / 0.95
 
 
 def pw_lut_index(k):

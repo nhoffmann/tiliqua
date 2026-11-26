@@ -93,6 +93,7 @@ class Params:
     dco_lfo_semi: float = 0.0   # vibrato depth, semitones at full LFO
     vcf_lfo:      float = 0.0   # LFO -> cutoff, normalized octaves (0.1 = 1 octave)
     vca_gate:     bool = False  # VCA Gate mode instead of envelope
+    dco_range: int = 1          # 0 = 16', 1 = 8', 2 = 4'
     # Global effects (firmware defaults: HPF flat, chorus off)
     hpf:    int = 1             # 0 bass boost, 1 flat, 2 240 Hz, 3 720 Hz
     chorus: int = 0             # 0 off, 1 I, 2 II, 3 I+II
@@ -134,6 +135,7 @@ def prepare(notes, seconds, params=None):
         "env_amt":        _raw(params.env_amt, ASQ),
         "cutoff_cv":      _raw(params.cutoff_cv_volts / 8.192, ASQ),
         "hpf_mode":       params.hpf,
+        "dco_range":      params.dco_range,
         "chorus_mode":    params.chorus,
     }
     events = []

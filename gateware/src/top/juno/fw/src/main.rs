@@ -164,7 +164,8 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_dco(opts.dco.saw.value == Switch::On,
                           opts.dco.pulse.value == Switch::On,
                           opts.dco.pwm_mode.value == PwmMode::Lfo,
-                          opts.adsr.vca_mode.value == VcaMode::Gate);
+                          opts.adsr.vca_mode.value == VcaMode::Gate,
+                          opts.dco.range.value as u8);
         app.synth.set_pw_knob(opts.dco.pw.value);
         app.synth.set_mix_levels(dco::sub_gain(opts.dco.sub.value),
                                  dco::level_gain(opts.dco.noise.value));
@@ -203,6 +204,7 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(24, global_index(opts, &opts.lfo.rate),        CcMapMode::Absolute);
     m.add(25, global_index(opts, &opts.lfo.delay),       CcMapMode::Absolute);
     // DCO page (CC 16-22)
+    m.add(15, global_index(opts, &opts.dco.range),       CcMapMode::Absolute);
     m.add(16, global_index(opts, &opts.dco.pwm_mode),    CcMapMode::Absolute);
     m.add(22, global_index(opts, &opts.dco.lfo),         CcMapMode::Absolute);
     m.add(17, global_index(opts, &opts.dco.saw),         CcMapMode::Absolute);
@@ -440,7 +442,7 @@ fn main() -> ! {
                                    HUE).ok();
                 draw::draw_name(&mut display, h_active/2, v_active-50, HUE,
                                 &bootinfo.manifest.name, &bootinfo.manifest.tag, &modeline).ok();
-                if opts.tracker.page.value == Page::Adsr {
+                if opts.tracker.page.value == Page::Env {
                     use draw::AdsrPhase;
                     let highlight = opts.selected().and_then(|i| {
                         match opts.view().options()[i].key().value() {

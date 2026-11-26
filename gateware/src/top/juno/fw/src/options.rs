@@ -10,8 +10,8 @@ pub enum Page {
     Lfo,
     Dco,
     Vcf,
-    Adsr,
-    Effect,
+    Env,
+    Fx,
     Misc,
 }
 
@@ -21,6 +21,20 @@ pub enum Switch {
     Off,
     #[default]
     On,
+}
+
+// Juno DCO range (octave): 16' = one octave down, 8' = normal, 4' = one octave up.
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum DcoRange {
+    #[strum(serialize = "16'")]
+    Ft16 = 0,
+    #[default]
+    #[strum(serialize = "8'")]
+    Ft8 = 1,
+    #[strum(serialize = "4'")]
+    Ft4 = 2,
 }
 
 // Juno HPF positions (JunoFx): bass boost, flat, 240 Hz, 720 Hz.
@@ -143,7 +157,9 @@ pub struct HelpOpts {
 }
 
 // Juno LFO (JunoLfo): one global triangle LFO with delay (fade-in after a new
-// note). Rate ~0.1 .. 20 Hz (exponential), delay 0 .. 1.5 s.
+// note). Knobs = Juno-106 sliders, KR-106-measured curves (fw lfo.rs).
+// Pages and option order follow the Juno-106 panel: LFO, DCO, VCF (incl. HPF),
+// ENV (VCA mode + ADSR), FX (chorus, drive).
 #[derive(OptionPage, Clone)]
 pub struct LfoOpts {
     #[option(21299)]
@@ -156,16 +172,18 @@ pub struct LfoOpts {
 // sub-oscillator and noise levels. All live (no table rewrite).
 #[derive(OptionPage, Clone)]
 pub struct DcoOpts {
+    #[option]
+    pub range: EnumOption<DcoRange>,
     #[option(0)]
     pub lfo: IntOption<LevelParams>,
-    #[option]
-    pub pwm_mode: EnumOption<PwmMode>,
-    #[option(Switch::On)]
-    pub saw: EnumOption<Switch>,
-    #[option(Switch::Off)]
-    pub pulse: EnumOption<Switch>,
     #[option(0)]
     pub pw: IntOption<PwParams>,
+    #[option]
+    pub pwm_mode: EnumOption<PwmMode>,
+    #[option(Switch::Off)]
+    pub pulse: EnumOption<Switch>,
+    #[option(Switch::On)]
+    pub saw: EnumOption<Switch>,
     #[option(0)]
     pub sub: IntOption<LevelParams>,
     #[option(0)]
@@ -176,32 +194,34 @@ pub struct DcoOpts {
 // the Juno-106 VCF FREQ slider (fw vcf.rs). Keyboard tracking relative to C1.
 #[derive(OptionPage, Clone)]
 pub struct VcfOpts {
+    #[option]
+    pub hpf: EnumOption<HpfMode>,
     #[option(11469)]
     pub cutoff: IntOption<CutoffParams>,
     #[option(16384)]
     pub reso: IntOption<ResoParams>,
-    #[option(19661)]
-    pub env_amt: IntOption<EnvAmtParams>,
     #[option]
     pub env_pol: EnumOption<EnvPolarity>,
-    #[option(16384)]
-    pub kbd_track: IntOption<KbdTrackParams>,
+    #[option(19661)]
+    pub env_amt: IntOption<EnvAmtParams>,
     #[option(0)]
     pub lfo: IntOption<LevelParams>,
-    #[option]
-    pub hpf: EnumOption<HpfMode>,
+    #[option(16384)]
+    pub kbd_track: IntOption<KbdTrackParams>,
 }
 
 #[derive(OptionPage, Clone)]
 pub struct EffectOpts {
-    #[option(8192)]
-    pub drive: IntOption<DriveParams>,
     #[option]
     pub chorus: EnumOption<ChorusMode>,
+    #[option(8192)]
+    pub drive: IntOption<DriveParams>,
 }
 
 #[derive(OptionPage, Clone)]
 pub struct AdsrOpts {
+    #[option]
+    pub vca_mode: EnumOption<VcaMode>,
     #[option(0)]
     pub attack: IntOption<AdsrTimeParams>,
     #[option(8192)]
@@ -210,8 +230,6 @@ pub struct AdsrOpts {
     pub sustain: IntOption<AdsrLevelParams>,
     #[option(6554)]
     pub release: IntOption<AdsrTimeParams>,
-    #[option]
-    pub vca_mode: EnumOption<VcaMode>,
 }
 
 #[derive(OptionPage, Clone)]
@@ -241,9 +259,9 @@ pub struct Opts {
     pub dco: DcoOpts,
     #[page(Page::Vcf)]
     pub vcf: VcfOpts,
-    #[page(Page::Adsr)]
+    #[page(Page::Env)]
     pub adsr: AdsrOpts,
-    #[page(Page::Effect)]
+    #[page(Page::Fx)]
     pub effect: EffectOpts,
     #[page(Page::Misc)]
     pub misc: MiscOpts,

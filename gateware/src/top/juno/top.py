@@ -90,6 +90,7 @@ can also be used to control most of these through CCs as follows:
         LFO     rate          24  LFO rate (~0.1 .. 20 Hz)
         LFO     delay         25  LFO fade-in after a new note (0 .. 1.5 s)
 
+        DCO     range         15  16' / 8' / 4' (octave)
         DCO     lfo           22  LFO -> pitch (vibrato depth)
         DCO     pwm-mode      16  pulse width source: manual / LFO
         DCO     saw           17  saw on/off (Juno curved ramp)
@@ -106,11 +107,11 @@ can also be used to control most of these through CCs as follows:
         VCF     lfo           34  LFO -> cutoff
         VCF     hpf           36  HPF: bass boost / flat / 240 Hz / 720 Hz
 
-        ADSR    attack        30  envelope attack (VCF + VCA)
-        ADSR    decay         31  envelope decay
-        ADSR    sustain       32  envelope sustain
-        ADSR    release       33  envelope release
-        ADSR    vca-mode      35  VCA follows envelope or gate
+        ENV     vca-mode      35  VCA follows envelope or gate
+        ENV     attack        30  envelope attack (VCF + VCA)
+        ENV     decay         31  envelope decay
+        ENV     sustain       32  envelope sustain
+        ENV     release       33  envelope release
 
         EFFECT  drive         40  distortion amount
         EFFECT  chorus        41  chorus off / I / II / I+II (stereo from the mono voice sum)
@@ -178,8 +179,9 @@ class PolySynth(wiring.Component):
     sub_gain: In(unsigned(16))
     noise_gain: In(unsigned(16))
 
-    # VCA mode, HPF / chorus and LFO
+    # VCA mode, DCO range, HPF / chorus and LFO
     vca_gate_mode: In(1)
+    dco_range: In(2)
     hpf_mode: In(2)
     chorus_mode: In(2)
     lfo_rate_inc: In(unsigned(32))
@@ -271,6 +273,7 @@ class PolySynth(wiring.Component):
             voice_block.sub_gain.eq(self.sub_gain),
             voice_block.noise_gain.eq(self.noise_gain),
             voice_block.vca_gate_mode.eq(self.vca_gate_mode),
+            voice_block.dco_range.eq(self.dco_range),
             voice_block.hpf_mode.eq(self.hpf_mode),
             voice_block.chorus_mode.eq(self.chorus_mode),
             voice_block.lfo_rate_inc.eq(self.lfo_rate_inc),
@@ -337,6 +340,7 @@ class SynthPeripheral(wiring.Component):
         pulse:    csr.Field(csr.action.W, unsigned(1))
         pwm_lfo:  csr.Field(csr.action.W, unsigned(1))
         vca_gate: csr.Field(csr.action.W, unsigned(1))
+        range:    csr.Field(csr.action.W, unsigned(2))   # 0 = 16', 1 = 8', 2 = 4'
 
     class PwKnob(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
@@ -463,6 +467,7 @@ class SynthPeripheral(wiring.Component):
                 self.synth.pulse_en.eq(self._dco.f.pulse.w_data),
                 self.synth.pwm_lfo.eq(self._dco.f.pwm_lfo.w_data),
                 self.synth.vca_gate_mode.eq(self._dco.f.vca_gate.w_data),
+                self.synth.dco_range.eq(self._dco.f.range.w_data),
             ]
         with m.If(self._pw_knob.f.value.w_stb):
             m.d.sync += self.synth.pw_knob.eq(self._pw_knob.f.value.w_data)

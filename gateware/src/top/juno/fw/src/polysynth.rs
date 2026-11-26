@@ -82,9 +82,11 @@ impl Polysynth0 {
     }
 
     /// Juno DCO mixer switches.
-    pub fn set_dco(&mut self, saw: bool, pulse: bool, pwm_lfo: bool, vca_gate: bool)  {
-        self.registers.dco().write(|w| w.saw().bit(saw).pulse().bit(pulse)
-                                         .pwm_lfo().bit(pwm_lfo).vca_gate().bit(vca_gate) );
+    /// DCO switches, VCA mode and DCO range (0 = 16', 1 = 8', 2 = 4').
+    pub fn set_dco(&mut self, saw: bool, pulse: bool, pwm_lfo: bool, vca_gate: bool, range: u8)  {
+        self.registers.dco().write(|w| unsafe { w.saw().bit(saw).pulse().bit(pulse)
+                                         .pwm_lfo().bit(pwm_lfo).vca_gate().bit(vca_gate)
+                                         .range().bits(range) } );
     }
 
     /// PW knob 0..32768 (gateware maps it through the curve LUT, incl. LFO PWM).

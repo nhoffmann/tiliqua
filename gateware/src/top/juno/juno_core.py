@@ -45,6 +45,7 @@ class JunoCore(wiring.Component):
             "voice_cutoff_base": In(data.ArrayLayout(ASQ, n)),
 
             # DCO
+            "dco_range":  In(2),              # 0 = 16' (-1 oct), 1 = 8', 2 = 4' (+1 oct)
             "saw_en":     In(1),
             "pulse_en":   In(1),
             "pw_knob":    In(unsigned(16)),   # 0..32768
@@ -104,10 +105,15 @@ class JunoCore(wiring.Component):
             self.lfo.eq(lfo.lfo),
         ]
 
+        # DCO range: -12 / 0 / +12 semitones (PitchSQ raw = semitones * 1024)
+        range_off = Signal(signed(16))
+        m.d.comb += range_off.eq(Mux(self.dco_range == 0, -12 << PitchToInc.FINE_BITS,
+                                 Mux(self.dco_range == 2, 12 << PitchToInc.FINE_BITS, 0)))
+
         for n in range(N):
             pitch = Signal(PitchToInc.PitchSQ, name=f"pitch_{n}")
             m.d.comb += [
-                pitch.as_value().eq(self.voice_pitch_base[n].as_value() + lfo.vib),
+                pitch.as_value().eq(self.voice_pitch_base[n].as_value() + lfo.vib + range_off),
                 voice.voice_pitch[n].eq(pitch),
                 voice.voice_gates[n].eq(self.voice_gates[n]),
                 voice.voice_velocity[n].eq(self.voice_velocity[n]),

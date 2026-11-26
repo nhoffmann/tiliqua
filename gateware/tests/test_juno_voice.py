@@ -428,6 +428,16 @@ class JunoVoiceTests(unittest.TestCase):
         expected = 440.0 * 2 ** (2 / 12)
         self.assertLess(abs(1200 * np.log2(f / expected)), 2.0)
 
+    def test_dco_range(self):
+        """DCO range 16' / 4' shifts A4 by exactly one octave down / up."""
+        for rng, expected in ((0, 220.0), (2, 880.0)):
+            with self.subTest(range=rng):
+                p = Params(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001,
+                           cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0, dco_range=rng)
+                out = render([Note(0, 69, 0.0, 1.0)], seconds=0.04, params=p)
+                f = estimate_freq(out[len(out) // 4:, 0])
+                self.assertLess(abs(1200 * np.log2(f / expected)), 2.0)
+
     def test_pitch_full_range(self):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the
         16-bit freq_inc of the upstream tracker is -25 cents at C1, +13.5 at C2)."""

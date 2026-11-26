@@ -35,6 +35,7 @@ use static_cell::StaticCell;
 use tiliqua_fw::dco;
 use tiliqua_fw::lfo;
 use tiliqua_fw::glide;
+use tiliqua_fw::variance;
 use tiliqua_fw::vcf;
 use tiliqua_fw::env;
 
@@ -136,7 +137,8 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
             for (voice, note) in notes.iter().enumerate() {
                 // kbd * (note - C1) / 12 octaves, 1 octave = 1/10 = 3276.8 raw
                 let track = kbd * (i32::from(*note) - vcf::KBD_REF_NOTE) / 120;
-                let base = (cutoff + track + mod_off).clamp(-32768, 32767);
+                let var = variance::cutoff_raw(voice, opts.voice.variance.value);
+                let base = (cutoff + track + mod_off + var).clamp(-32768, 32767);
                 app.synth.set_cutoff_base(voice, base as i16);
             }
             let amt = i32::from(opts.vcf.env_amt.value).min(32767);
@@ -170,6 +172,17 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         app.synth.set_pw_knob(opts.dco.pw.value);
         app.synth.set_mix_levels(dco::sub_gain(opts.dco.sub.value),
                                  dco::level_gain(opts.dco.noise.value));
+
+        // Key assign + per-voice detune (variance, unison spread): only on change
+        let unison = opts.voice.assign.value == AssignMode::Unison;
+        let voice_knobs = (unison, opts.voice.detune.value, opts.voice.variance.value);
+        if app.last_voice_knobs != Some(voice_knobs) {
+            app.last_voice_knobs = Some(voice_knobs);
+            for voice in 0..N_VOICES {
+                let d = variance::detune_raw(voice, voice_knobs.2, unison, voice_knobs.1);
+                app.synth.set_voice_cfg(voice, d, unison);
+            }
+        }
 
         // Portamento (float conversion only when the knob moves)
         if app.last_porta != Some(opts.voice.porta.value) {
@@ -209,6 +222,9 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     let mut m = MidiCcMapper::new();
     // VOICE page (CC 5 = MIDI portamento time)
     m.add(5,  global_index(opts, &opts.voice.porta),     CcMapMode::Absolute);
+    m.add(14, global_index(opts, &opts.voice.assign),    CcMapMode::Absolute);
+    m.add(94, global_index(opts, &opts.voice.detune),    CcMapMode::Absolute);
+    m.add(9,  global_index(opts, &opts.voice.variance),  CcMapMode::Absolute);
     // LFO page (CC 24-25)
     m.add(24, global_index(opts, &opts.lfo.rate),        CcMapMode::Absolute);
     m.add(25, global_index(opts, &opts.lfo.delay),       CcMapMode::Absolute);
@@ -259,6 +275,8 @@ struct App {
     last_lfo_knobs: Option<(u16, u16, u16, u16)>,
     // last portamento knob written
     last_porta: Option<u16>,
+    // last key assign / detune / variance written
+    last_voice_knobs: Option<(bool, u16, u16)>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
 }
@@ -280,6 +298,7 @@ impl App {
             mod_wheel: 0,
             last_lfo_knobs: None,
             last_porta: None,
+            last_voice_knobs: None,
             last_env_knobs: None,
             cc_mapper,
         }

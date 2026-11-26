@@ -28,6 +28,8 @@ from top.juno.fx_model import FxModel
 from top.juno.adsr_model import AdsrModel, attack_inc_for_time, eps_for_time
 from top.juno.juno_fx import JunoFx
 from top.juno.juno_glide import GlideModel, JunoGlide, glide_coef, glide_time
+from top.juno.juno_tracker import JunoVoiceTracker
+from tiliqua.midi.types import Status
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
 from top.juno.sim_render import render as render_amaranth
@@ -448,6 +450,7 @@ class JunoVoiceTests(unittest.TestCase):
         model = GlideModel(N)
         rng = random.Random(4)
         coefs = [116, 116, 3000, (1 << 18) - 1, 0, 40000, 1]
+        detune = [rng.randrange(-512, 512) for _ in range(N)]
         mismatches = []
 
         async def testbench(ctx):
@@ -461,15 +464,19 @@ class JunoVoiceTests(unittest.TestCase):
                     # tiny jumps at the slowest glide: step rounds to 0 -> snap
                     coef = 116
                     if frame % 10 == 0:
-                        targets = [model.pitch(n) + rng.choice([-7, -2, 1, 4]) for n in range(N)]
+                        targets = [model.pitch(n) - detune[n] + rng.choice([-7, -2, 1, 4])
+                                   for n in range(N)]
+                if frame % 50 == 0:
+                    detune = [rng.randrange(-512, 512) for _ in range(N)]
                 for n in range(N):
                     ctx.set(dut.target[n].as_value(), targets[n])
+                    ctx.set(dut.detune[n], detune[n])
                 ctx.set(dut.coef, coef)
                 ctx.set(dut.tick, 1)
                 await ctx.tick()
                 ctx.set(dut.tick, 0)
                 await ctx.tick().repeat(4 * N + 3)
-                model.tick(targets, coef)
+                model.tick(targets, coef, detune)
                 for n in range(N):
                     got = ctx.get(dut.pitch[n].as_value())
                     if got != model.pitch(n):
@@ -515,6 +522,55 @@ class JunoVoiceTests(unittest.TestCase):
         out = render([Note(0, 69, 0.0, 1.0)], seconds=0.3, params=p)[:, 0]
         f = estimate_freq(out[-int(0.03 * FS):])
         self.assertLess(abs(1200 * np.log2(f / (440.0 * 2 ** (2 / 12)))), 2.0)
+
+    def test_voice_detune(self):
+        """Per-voice variance (voice 4: +2.9 cents) and unison spread (voice 1:
+        +25 cents at detune 1) reach the oscillator pitch."""
+        base = dict(attack=0.0002, decay=0.0002, sustain=1.0, release=0.001,
+                    cutoff=0.85, env_amt=0.0, kbd=0.0, res=0.0)
+        for voice, kw, cents in ((4, dict(variance=1.0), 2.9),
+                                 (1, dict(unison_detune=1.0), 25.0)):
+            with self.subTest(voice=voice):
+                out = render([Note(voice, 69, 0.0, 1.0)], seconds=0.25,
+                             params=Params(**base, **kw))
+                f = estimate_freq(out[len(out) // 2:, 0])
+                self.assertLess(abs(1200 * np.log2(f / 440.0) - cents), 0.5)
+
+    def test_tracker_unison(self):
+        """Unison: every note goes to all voices (legato, last note), the note-off
+        of the sounding note releases all; poly mode still allocates one voice."""
+        dut = JunoVoiceTracker(max_voices=6)
+        seen = {}
+
+        def msg(kind, note):
+            key = 'note_on' if kind == Status.Kind.NOTE_ON else 'note_off'
+            return {'status': {'kind': kind, 'nibble': {'channel': 0}},
+                    'midi_payload': {key: {'note': note, 'velocity': 0x60}}}
+
+        async def testbench(ctx):
+            async def send(kind, note):
+                await stream.put(ctx, dut.i, msg(kind, note))
+                await ctx.tick().repeat(40)
+                seen[(kind, note, len(seen))] = [(ctx.get(dut.o[n].note), ctx.get(dut.o[n].gate))
+                                                 for n in range(6)]
+            ctx.set(dut.unison, 1)
+            await send(Status.Kind.NOTE_ON, 60)
+            await send(Status.Kind.NOTE_ON, 64)
+            await send(Status.Kind.NOTE_OFF, 60)
+            await send(Status.Kind.NOTE_OFF, 64)
+            ctx.set(dut.unison, 0)
+            await send(Status.Kind.NOTE_ON, 67)
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+        states = list(seen.values())
+        self.assertEqual(states[0], [(60, 1)] * 6)
+        self.assertEqual(states[1], [(64, 1)] * 6)
+        self.assertEqual(states[2], [(64, 1)] * 6)   # released key not sounding
+        self.assertEqual(states[3], [(64, 0)] * 6)
+        self.assertEqual(sum(1 for s in states[4] if s == (67, 1)), 1)
 
     def test_pitch_full_range(self):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the

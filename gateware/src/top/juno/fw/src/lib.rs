@@ -14,6 +14,7 @@ pub mod polysynth;
 pub mod dco;
 pub mod lfo;
 pub mod glide;
+pub mod variance;
 pub mod vcf;
 pub mod env;
 

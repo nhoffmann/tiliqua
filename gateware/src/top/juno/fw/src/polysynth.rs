@@ -104,6 +104,13 @@ impl Polysynth0 {
         self.registers.lfo_delay().write(|w| unsafe { w.value().bits(step) } );
     }
 
+    /// Unison mode + one voice's pitch offset (1/1024 semitones, 10 bit signed).
+    pub fn set_voice_cfg(&mut self, voice: usize, detune: i16, unison: bool)  {
+        let d = (detune as u16) & 0x3FF;
+        self.registers.voice_cfg().write(|w| unsafe {
+            w.detune().bits(d).voice().bits(voice as u8).unison().bit(unison) } );
+    }
+
     /// Portamento coefficient (`juno_glide`), 0 = off.
     pub fn set_glide(&mut self, coef: u32)  {
         self.registers.glide().write(|w| unsafe { w.coef().bits(coef) } );

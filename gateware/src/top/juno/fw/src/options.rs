@@ -67,6 +67,15 @@ pub enum ChorusMode {
     Both = 3,
 }
 
+// Key assign: poly (6 voices) or unison (all voices on the last note, legato).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum AssignMode {
+    #[default]
+    Poly,
+    Unison,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
 #[strum(serialize_all = "kebab-case")]
 pub enum PwmMode {
@@ -157,12 +166,20 @@ pub struct HelpOpts {
     pub scroll: IntOption<ScrollParams>,
 }
 
-// Voice / keyboard controls (Juno-106 left-hand panel): portamento (per-voice
-// exponential glide on the note pitch, juno_glide; knob^3 * 3 s, 0 = off).
+// Voice / keyboard controls (Juno-106 left-hand panel): key assign (poly /
+// unison), portamento (per-voice exponential glide on the note pitch, juno_glide;
+// knob^3 * 3 s, 0 = off), unison detune spread (0 .. +-25 cents) and per-voice
+// variance (1.0 = KR-106 tolerances: pitch +-3 cents, cutoff +-5 %; fw variance.rs).
 #[derive(OptionPage, Clone)]
 pub struct VoiceOpts {
+    #[option]
+    pub assign: EnumOption<AssignMode>,
     #[option(0)]
     pub porta: IntOption<LevelParams>,
+    #[option(0)]
+    pub detune: IntOption<LevelParams>,
+    #[option(32768)]
+    pub variance: IntOption<LevelParams>,
 }
 
 // Juno LFO (JunoLfo): one global triangle LFO with delay (fade-in after a new

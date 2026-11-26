@@ -86,7 +86,10 @@ can also be used to control most of these through CCs as follows:
         ────    ─────────     ──  ───────────
         HELP    scroll         -  scroll help text up/down
 
+        VOICE   assign        14  poly / unison (all voices, last note, legato)
         VOICE   porta          5  portamento (per-voice glide, 0 = off .. 3 s)
+        VOICE   detune        94  unison spread (0 .. +-25 cents)
+        VOICE   variance       9  per-voice tolerances (pitch +-3 ct, cutoff +-5 %)
 
         LFO     rate          24  LFO rate (0.05 .. 29.5 Hz)
         LFO     delay         25  LFO fade-in after a new note (0 .. 3.4 s)
@@ -189,8 +192,12 @@ class PolySynth(wiring.Component):
     lfo_delay_step: In(unsigned(32))
     lfo_dco_depth: In(unsigned(16))
     lfo_vcf_depth: In(unsigned(16))
-    # portamento (juno_glide coef, 0 = off)
+    # portamento (juno_glide coef, 0 = off), unison, per-voice detune
     glide_coef: In(unsigned(18))
+    unison: In(1)
+    detune_we: In(1)
+    detune_voice: In(3)
+    detune_value: In(signed(10))
 
 
     # Jack detection (directly from pmod hardware)
@@ -239,6 +246,13 @@ class PolySynth(wiring.Component):
         drive_val = Signal(SQDrive)
         m.d.comb += drive_val.eq(drive_sum.saturate(SQDrive))
 
+        # per-voice detune (variance + unison spread), latched one voice per write
+        for n in range(n_voices):
+            detune = Signal(signed(10), name=f"detune_{n}")
+            with m.If(self.detune_we & (self.detune_voice == n)):
+                m.d.sync += detune.eq(self.detune_value)
+            m.d.comb += voice_block.voice_detune[n].eq(detune)
+
         # per-voice params
         for n in range(n_voices):
             # Note-on velocity scales the envelope (VCF + VCA).
@@ -282,6 +296,7 @@ class PolySynth(wiring.Component):
             voice_block.lfo_delay_step.eq(self.lfo_delay_step),
             voice_block.pitch_bend.as_value().eq(voice_tracker.pitch_bend.as_value() >> BEND_SHIFT),
             voice_block.glide_coef.eq(self.glide_coef),
+            voice_tracker.unison.eq(self.unison),
             voice_block.lfo_dco_depth.eq(self.lfo_dco_depth),
             voice_block.lfo_vcf_depth.eq(self.lfo_vcf_depth),
         ]
@@ -358,6 +373,12 @@ class SynthPeripheral(wiring.Component):
     class Glide(csr.Register, access="w"):
         coef: csr.Field(csr.action.W, unsigned(18))
 
+    class VoiceCfg(csr.Register, access="w"):
+        # per-voice detune (1/1024 semitones), written one voice at a time
+        detune: csr.Field(csr.action.W, signed(10))
+        voice:  csr.Field(csr.action.W, unsigned(3))
+        unison: csr.Field(csr.action.W, unsigned(1))
+
     class LfoDepths(csr.Register, access="w"):
         dco: csr.Field(csr.action.W, unsigned(16))
         vcf: csr.Field(csr.action.W, unsigned(16))
@@ -432,6 +453,7 @@ class SynthPeripheral(wiring.Component):
         self._lfo_delay     = regs.add("lfo_delay",     self.LfoDelay(),      offset=voices_csr_end + 0x5C)
         self._lfo_depths    = regs.add("lfo_depths",    self.LfoDepths(),     offset=voices_csr_end + 0x60)
         self._glide         = regs.add("glide",         self.Glide(),         offset=voices_csr_end + 0x64)
+        self._voice_cfg     = regs.add("voice_cfg",     self.VoiceCfg(),      offset=voices_csr_end + 0x68)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -484,6 +506,13 @@ class SynthPeripheral(wiring.Component):
             m.d.sync += self.synth.lfo_rate_inc.eq(self._lfo_rate.f.value.w_data)
         with m.If(self._lfo_delay.f.value.w_stb):
             m.d.sync += self.synth.lfo_delay_step.eq(self._lfo_delay.f.value.w_data)
+        m.d.sync += self.synth.detune_we.eq(self._voice_cfg.element.w_stb)
+        with m.If(self._voice_cfg.element.w_stb):
+            m.d.sync += [
+                self.synth.unison.eq(self._voice_cfg.f.unison.w_data),
+                self.synth.detune_voice.eq(self._voice_cfg.f.voice.w_data),
+                self.synth.detune_value.eq(self._voice_cfg.f.detune.w_data),
+            ]
         with m.If(self._glide.f.coef.w_stb):
             m.d.sync += self.synth.glide_coef.eq(self._glide.f.coef.w_data)
         with m.If(self._lfo_depths.element.w_stb):

@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
         {"chorus_mode",    [&](int64_t v) { top->chorus_mode = v; }},
         {"pitch_bend",     [&](int64_t v) { top->pitch_bend = v & ((1 << PITCH_W) - 1); }},
         {"glide_coef",     [&](int64_t v) { top->glide_coef = v; }},
+        {"voice_detune",   [&](int64_t v) { top->voice_detune = v; }},
     };
 
     long n_samples = 0;

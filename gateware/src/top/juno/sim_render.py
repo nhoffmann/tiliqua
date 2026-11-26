@@ -36,7 +36,7 @@ from top.juno.juno_lfo import pw_knob_to_point
 from top.juno.juno_voice import MultiADSR, MultiLadder, PitchToInc
 from top.juno.ladder_model import KBD_REF_NOTE, res_knob_to_reg
 from top.juno.adsr_model import attack_inc_for_time, eps_for_time
-from top.juno.juno_glide import glide_coef
+from top.juno.juno_glide import DETUNE_BITS, glide_coef
 
 FS = 48000
 N_VOICES = 6
@@ -82,6 +82,9 @@ class Params:
     mod_wheel: float = 0.0
     bend_semitones: float = 0.0    # pitch bend applied to all notes (top.py: +-2 range)
     portamento: float = 0.0        # glide time constant in seconds (0 = off, juno_glide)
+    detune_cents: tuple = ()       # extra per-voice pitch offsets in cents
+    variance: float = 0.0          # per-voice tolerances 0..1 (firmware default 1.0)
+    unison_detune: float = 0.0     # unison spread knob 0..1 (+-25 cents; firmware: unison only)
     cutoff_cv_volts: float = 0.0   # CV in1, 1 V/oct
     # Juno DCO mixer (firmware defaults: saw on, rest off)
     saw:   bool = True
@@ -100,6 +103,34 @@ class Params:
     # Global effects (firmware defaults: HPF flat, chorus off)
     hpf:    int = 1             # 0 bass boost, 1 flat, 2 240 Hz, 3 720 Hz
     chorus: int = 0             # 0 off, 1 I, 2 II, 3 I+II
+
+
+# Per-voice variance (component tolerances), same as firmware variance.rs.
+VARIANCE_PITCH_CENTS = [1.8, -2.6, 0.7, -1.2, 2.9, -0.4]
+VARIANCE_CUTOFF_PCT = [-3.1, 4.6, -0.8, 2.2, -4.7, 1.5]
+UNISON_SPREAD = [-1.0, 1.0, -0.6, 0.6, -0.2, 0.2]
+DETUNE_MAX_CENTS = 25.0
+
+
+def voice_detune_cents(params, n_voices=6):
+    extra = list(params.detune_cents) + [0.0] * n_voices
+    return [VARIANCE_PITCH_CENTS[v] * params.variance
+            + UNISON_SPREAD[v] * params.unison_detune * DETUNE_MAX_CENTS + extra[v]
+            for v in range(n_voices)]
+
+
+def variance_cutoff(params, voice):
+    """Cutoff offset in normalized octaves (firmware: CUTOFF_RAW / 32768)."""
+    import math
+    return math.log2(1 + VARIANCE_CUTOFF_PCT[voice] / 100) / 10 * params.variance
+
+
+def pack_detune(cents):
+    """Per-voice cents -> packed ``voice_detune`` (10-bit signed, 1/1024 semitones)."""
+    packed = 0
+    for n, c in enumerate(cents):
+        packed |= (round(c / 100 * 1024) & ((1 << DETUNE_BITS) - 1)) << (n * DETUNE_BITS)
+    return packed
 
 
 def _raw(value, shape):
@@ -141,11 +172,13 @@ def prepare(notes, seconds, params=None):
         "dco_range":      params.dco_range,
         "pitch_bend":     _raw(params.bend_semitones, PitchToInc.PitchSQ),
         "glide_coef":     glide_coef(params.portamento),
+        "voice_detune":   pack_detune(voice_detune_cents(params)),
         "chorus_mode":    params.chorus,
     }
     events = []
     for n in notes:
-        base = cutoff_base(params.cutoff, params.kbd, n.note, params.mod_wheel)
+        base = (cutoff_base(params.cutoff, params.kbd, n.note, params.mod_wheel)
+                + variance_cutoff(params, n.voice))
         on = (int(n.on_s * FS), n.voice, 1,
               _raw(n.note, PitchToInc.PitchSQ),
               _raw(n.velocity, EnvUQ),
@@ -269,6 +302,13 @@ SCENES = {
                     Params(cutoff=0.4, env_amt=0.0, kbd=0.5)),
     "cutoff_bright": (lambda s: [Note(0, 48, 0.0, s * 0.8), Note(1, 55, 0.0, s * 0.8)],
                       Params(cutoff=0.75, env_amt=0.0, kbd=0.5)),
+    # unison (all 6 voices on each note, as the tracker assigns it; notes retriggered
+    # here, the tracker plays overlapping notes legato), per-voice variance + spread
+    # 0.3 (+-7.5 cents), short glide
+    "unison": (lambda s: [Note(v, n, i * s / 4, (i + 1) * s / 4 - (0.02 if i == 3 else 0))
+                          for i, n in enumerate([36, 43, 39, 36]) for v in range(6)],
+               Params(variance=1.0, unison_detune=0.3, portamento=0.03, cutoff=0.5,
+                      env_amt=0.5, sustain=0.7, release=0.4)),
     # portamento: one voice C3 -> C4 -> G3 -> C3 (time constant 80 ms), then a
     # two-voice chord moving up a fourth (each voice glides from its own last note)
     "portamento": (lambda s: [Note(0, n, i * s / 8, (i + 1) * s / 8)

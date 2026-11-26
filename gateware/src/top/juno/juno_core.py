@@ -7,7 +7,7 @@ the hardware top level (``top.py``) and the offline renderer (``sim_render.py``)
 - ``JunoFx``: 4-position HPF + BBD-style stereo chorus on the mono sum.
 - ``JunoLfo``: one triangle LFO with delay, ticked once per output frame
   (each handshake on ``o``), routed to:
-  - pitch: ``voice_pitch = glide(voice_pitch_base) + bend + vib + range``
+  - pitch: ``voice_pitch = glide(voice_pitch_base + detune) + bend + vib + range``
     (``JunoGlide`` portamento per voice; bend, vibrato, DCO range immediate),
   - filter: ``cutoff_mod`` (normalized octaves),
   - pulse width: ``pw_point`` (manual or LFO PWM).
@@ -24,12 +24,12 @@ try:
     from juno_voice import JunoVoice, MultiADSR, PipelinedMAC, PitchToInc
     from juno_lfo import JunoLfo
     from juno_fx import JunoFx
-    from juno_glide import JunoGlide, COEF_BITS as GLIDE_COEF_BITS
+    from juno_glide import JunoGlide, COEF_BITS as GLIDE_COEF_BITS, DETUNE_BITS
 except ImportError:
     from top.juno.juno_voice import JunoVoice, MultiADSR, PipelinedMAC, PitchToInc
     from top.juno.juno_lfo import JunoLfo
     from top.juno.juno_fx import JunoFx
-    from top.juno.juno_glide import JunoGlide, COEF_BITS as GLIDE_COEF_BITS
+    from top.juno.juno_glide import JunoGlide, COEF_BITS as GLIDE_COEF_BITS, DETUNE_BITS
 
 
 class JunoCore(wiring.Component):
@@ -50,6 +50,8 @@ class JunoCore(wiring.Component):
             # global pitch: bend (PitchSQ raw, added after the glide), portamento
             "pitch_bend": In(PitchToInc.PitchSQ),
             "glide_coef": In(unsigned(GLIDE_COEF_BITS)),   # 0 = off (juno_glide)
+            # per-voice pitch offset, 1/1024 semitones (variance + unison spread)
+            "voice_detune": In(data.ArrayLayout(signed(DETUNE_BITS), n)),
 
             # DCO
             "dco_range":  In(2),              # 0 = 16' (-1 oct), 1 = 8', 2 = 4' (+1 oct)
@@ -125,6 +127,7 @@ class JunoCore(wiring.Component):
             pitch = Signal(PitchToInc.PitchSQ, name=f"pitch_{n}")
             m.d.comb += [
                 glide.target[n].eq(self.voice_pitch_base[n]),
+                glide.detune[n].eq(self.voice_detune[n]),
                 pitch.as_value().eq(glide.pitch[n].as_value() + pitch_off),
                 voice.voice_pitch[n].eq(pitch),
                 voice.voice_gates[n].eq(self.voice_gates[n]),

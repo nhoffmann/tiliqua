@@ -16,6 +16,10 @@ Copied from ``tiliqua.midi.voice_tracker`` (upstream, unmodified) and reduced:
 - No mod wheel velocity capping (``velocity_mod`` option removed): with a VCA, CC1 = 0
   would mute the synth. ``velocity_on`` holds the note-on velocity (not changed by
   poly pressure).
+- Unison (Phase 4.6, ``unison`` input): every NOTE_ON goes to all voices (last-note
+  priority, no note stack). A new note while the voices are gated changes the pitch
+  without retriggering the envelopes (legato; glides with portamento). NOTE_OFF of
+  the sounding note releases all voices (the existing per-note cull).
 """
 
 from amaranth import *
@@ -56,6 +60,7 @@ class JunoVoiceTracker(wiring.Component):
         super().__init__({
             "i": In(stream.Signature(MidiMessage)),
             "voice_active": In(data.ArrayLayout(unsigned(1), max_voices)),
+            "unison": In(1),
             "o": Out(JunoVoiceState).array(max_voices),
             "pitch_bend": Out(ASQ),
         });
@@ -93,6 +98,8 @@ class JunoVoiceTracker(wiring.Component):
                                 # NOTE_ON with velocity=0, and this should be treated exactly
                                 # the same as a note OFF.
                                 m.next = 'NOTE-OFF'
+                            with m.Elif(self.unison):
+                                m.next = 'NOTE-ON-COMMIT'
                             with m.Else():
                                 m.d.sync += voice_ix_write.eq(0)
                                 m.next = 'NOTE-ON-MATCH'
@@ -150,18 +157,17 @@ class JunoVoiceTracker(wiring.Component):
                         m.next = 'WAIT-VALID'
 
             with m.State('NOTE-ON-COMMIT'):
-                # commit the new note to the found slot
-                with m.Switch(voice_ix_write):
-                    for n in range(self.max_voices):
-                        with m.Case(n):
-                            m.d.sync += [
-                                voice_mask.bit_select(n, 1).eq(1),
-                                sustain_mask.bit_select(n, 1).eq(0),
-                                self.o[n].note.eq(msg.midi_payload.note_on.note),
-                                self.o[n].velocity.eq(msg.midi_payload.note_on.velocity),
-                                self.o[n].gate.eq(1),
-                                self.o[n].velocity_on.eq(msg.midi_payload.note_on.velocity),
-                            ]
+                # commit the new note to the found slot (unison: to all slots)
+                for n in range(self.max_voices):
+                    with m.If(self.unison | (voice_ix_write == n)):
+                        m.d.sync += [
+                            voice_mask.bit_select(n, 1).eq(1),
+                            sustain_mask.bit_select(n, 1).eq(0),
+                            self.o[n].note.eq(msg.midi_payload.note_on.note),
+                            self.o[n].velocity.eq(msg.midi_payload.note_on.velocity),
+                            self.o[n].gate.eq(1),
+                            self.o[n].velocity_on.eq(msg.midi_payload.note_on.velocity),
+                        ]
                 m.next = 'WAIT-VALID'
 
             with m.State('NOTE-OFF'):

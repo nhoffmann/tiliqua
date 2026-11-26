@@ -1115,6 +1115,10 @@ class JunoVoice(wiring.Component):
 
             # Per-voice envelope level (top 8 bits of ADSR output)
             "voice_cutoffs":     Out(data.ArrayLayout(unsigned(8), self.n_voices)),
+
+            # Full envelope of one voice (CV output, Phase 5.3)
+            "env_tap_voice":     In(range(self.n_voices)),
+            "env_tap":           Out(MultiADSR.EnvUQ),
         })
 
     def elaborate(self, platform):
@@ -1174,6 +1178,8 @@ class JunoVoice(wiring.Component):
                     with m.Case(n):
                         m.d.sync += self.voice_cutoffs[n].eq(
                             adsr.o.payload.sample.as_value() >> 8)
+            with m.If(env_voice_ix == self.env_tap_voice):
+                m.d.sync += self.env_tap.eq(adsr.o.payload.sample)
             with m.If(env_voice_ix == N - 1):
                 m.d.sync += env_voice_ix.eq(0)
             with m.Else():

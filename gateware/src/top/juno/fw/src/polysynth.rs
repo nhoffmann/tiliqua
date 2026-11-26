@@ -111,10 +111,29 @@ impl Polysynth0 {
     }
 
     /// Unison mode + one voice's pitch offset (1/1024 semitones, 10 bit signed).
-    pub fn set_voice_cfg(&mut self, voice: usize, detune: i16, unison: bool)  {
+    pub fn set_voice_cfg(&mut self, voice: usize, detune: i16, unison: bool, bend_range: u8)  {
         let d = (detune as u16) & 0x3FF;
         self.registers.voice_cfg().write(|w| unsafe {
-            w.detune().bits(d).voice().bits(voice as u8).unison().bit(unison) } );
+            w.detune().bits(d).voice().bits(voice as u8).unison().bit(unison)
+             .bend_range().bits(bend_range.min(12)) } );
+    }
+
+    /// CV routing: pitch / cutoff source jack (0 off, 1..4), CV out sources.
+    pub fn set_cv_route(&mut self, pitch_src: u8, cutoff_src: u8, out0: u8, out1: u8)  {
+        self.registers.cv_route().write(|w| unsafe {
+            w.pitch_src().bits(pitch_src).cutoff_src().bits(cutoff_src)
+             .out0_src().bits(out0).out1_src().bits(out1) } );
+    }
+
+    /// CV amounts for the audio-rate routes, SQ(2,14) (16384 = 1V/oct).
+    pub fn set_cv_amt(&mut self, pitch: i16, cutoff: i16)  {
+        self.registers.cv_amt().write(|w| unsafe {
+            w.pitch().bits(pitch as u16).cutoff().bits(cutoff as u16) } );
+    }
+
+    /// Current MIDI pitch bend, -32768..32767 (= -1..1).
+    pub fn pitch_bend(&self) -> i16 {
+        self.registers.bend().read().value().bits() as i16
     }
 
     /// Portamento coefficient (`juno_glide`), 0 = off.

@@ -13,6 +13,7 @@ pub enum Page {
     Vcf,
     Env,
     Fx,
+    Cv,
     Misc,
 }
 
@@ -65,6 +66,39 @@ pub enum ChorusMode {
     II = 2,
     #[strum(serialize = "I+II")]
     Both = 3,
+}
+
+// CV input targets (fw cv.rs). Pitch / cutoff: audio rate in gateware (1V/oct at
+// amount 1.0); the rest: firmware knob offsets (+-5 V x amount 1.0 = full range).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum CvTarget {
+    #[default]
+    Off,
+    Pitch,
+    Cutoff,
+    Pw,
+    Reso,
+    EnvAmt,
+    LfoRate,
+    Vibrato,
+    VcfLfo,
+    Porta,
+    Level,
+    Drive,
+}
+
+// CV output sources (juno_cv.JunoCvOut; values = gateware source index).
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum CvOutSrc {
+    Off = 0,
+    #[default]
+    Lfo = 1,
+    Env = 2,
+    Gate = 3,
+    Pitch = 4,
 }
 
 // Key assign: poly (6 voices) or unison (all voices on the last note, legato).
@@ -146,6 +180,8 @@ impl MidiChannel {
 }
 
 int_params!(PageNumParams<u16>    { step: 1, min: 0, max: 0 });
+int_params!(BendParams<u16>       { step: 1, min: 0, max: 12 });
+int_params!(CvAmtParams<i16>      { step: 512, min: -16384, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
 int_params!(DriveParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(LevelParams<u16>      { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 int_params!(PwParams<u16>         { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
@@ -170,6 +206,9 @@ pub struct HelpOpts {
 // unison), portamento (per-voice exponential glide on the note pitch, juno_glide;
 // knob^3 * 3 s, 0 = off), unison detune spread (0 .. +-25 cents) and per-voice
 // variance (1.0 = KR-106 tolerances: pitch +-3 cents, cutoff +-5 %; fw variance.rs).
+// Performance (Juno-106 bender section): bend range (semitones), bender -> VCF
+// (0 .. +-2 octaves), mod wheel -> vibrato depth (the Juno-106 LFO lever; same
+// curve as the DCO LFO knob, added to it).
 #[derive(OptionPage, Clone)]
 pub struct VoiceOpts {
     #[option]
@@ -180,6 +219,12 @@ pub struct VoiceOpts {
     pub detune: IntOption<LevelParams>,
     #[option(32768)]
     pub variance: IntOption<LevelParams>,
+    #[option(2)]
+    pub bend: IntOption<BendParams>,
+    #[option(0)]
+    pub bend_vcf: IntOption<LevelParams>,
+    #[option(16384)]
+    pub wheel: IntOption<LevelParams>,
 }
 
 // Juno LFO (JunoLfo): one global triangle LFO with delay (fade-in after a new
@@ -263,6 +308,31 @@ pub struct AdsrOpts {
     pub release: IntOption<AdsrTimeParams>,
 }
 
+// CV jacks: in0..in3 target + amount, out0 / out1 source.
+#[derive(OptionPage, Clone)]
+pub struct CvOpts {
+    #[option(CvTarget::Pitch)]
+    pub in0: EnumOption<CvTarget>,
+    #[option(16384)]
+    pub amt0: IntOption<CvAmtParams>,
+    #[option(CvTarget::Cutoff)]
+    pub in1: EnumOption<CvTarget>,
+    #[option(16384)]
+    pub amt1: IntOption<CvAmtParams>,
+    #[option(CvTarget::Off)]
+    pub in2: EnumOption<CvTarget>,
+    #[option(16384)]
+    pub amt2: IntOption<CvAmtParams>,
+    #[option(CvTarget::Off)]
+    pub in3: EnumOption<CvTarget>,
+    #[option(16384)]
+    pub amt3: IntOption<CvAmtParams>,
+    #[option(CvOutSrc::Lfo)]
+    pub out0: EnumOption<CvOutSrc>,
+    #[option(CvOutSrc::Env)]
+    pub out1: EnumOption<CvOutSrc>,
+}
+
 #[derive(OptionPage, Clone)]
 pub struct MiscOpts {
     #[option]
@@ -296,6 +366,8 @@ pub struct Opts {
     pub adsr: AdsrOpts,
     #[page(Page::Fx)]
     pub effect: EffectOpts,
+    #[page(Page::Cv)]
+    pub cv: CvOpts,
     #[page(Page::Misc)]
     pub misc: MiscOpts,
 }

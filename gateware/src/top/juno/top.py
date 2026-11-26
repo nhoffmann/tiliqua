@@ -8,14 +8,14 @@
 
               Audio / CV
            ┌────┐
-           │in0 │◄─ -
-           │in1 │◄─ filter cutoff (1V/oct)
-           │in2 │◄─ drive
-           │in3 │◄─ -
+           │in0 │◄─ CV (CV page; default pitch 1V/oct)
+           │in1 │◄─ CV (CV page; default filter cutoff 1V/oct)
+           │in2 │◄─ CV (CV page; default off)
+           │in3 │◄─ CV (CV page; default off)
            └────┘
            ┌────┐
-           │out0│─► -
-           │out1│─► MIDI CLK
+           │out0│─► CV out (CV page: LFO / env / gate / pitch)
+           │out1│─► CV out (CV page: LFO / env / gate / pitch)
            │out2│─► audio out (L)
            │out3│─► audio out (R)
            └────┘
@@ -28,20 +28,22 @@ supported, selected on the MISC page).
     - Note velocity scales each voice's envelope (filter and VCA).
 
     - Filter cutoff is exponential (Juno-style): cutoff knob + keyboard tracking +
-      mod wheel (computed per voice by firmware) + env amount x envelope + CV in1
+      bender (computed per voice by firmware) + env amount x envelope + cutoff CV
       (1V/oct, computed per voice in gateware). The envelope also drives a per-voice VCA.
 
     - Oscillator: Juno DCO per voice (curved saw, pulse with width, sub-oscillator
       one octave down, shared noise), band-limited (PolyBLEP), mixed with the
       DCO page settings.
 
-    - When a jack is patched into input 1 or 2, CV modulates all voices up to
-      audio rate (filter cutoff 1V/oct, drive as a bipolar offset). Input 0 is
-      unused for now (assignable CV inputs are planned).
+    - CV inputs (CV page): each jack has a target and a bipolar amount. Pitch and
+      cutoff (1V/oct at amount 1.0) are applied in gateware at audio rate; the
+      other targets (PW, resonance, env amount, LFO rate / vibrato / VCF depth,
+      portamento, level, drive) by the firmware at its 200 Hz tick (+-5 V at
+      amount 1.0 = the whole knob range). Unpatched jacks do nothing.
 
 All 6 voices are summed to mono (Juno-style); the stereo image comes from the
 chorus. End of chain: 4-position HPF, BBD-style chorus (off / I / II / I+II),
-then distortion (drive).
+then the output stage (level, optional drive into a soft limiter).
 
     .. code-block:: text
 
@@ -73,9 +75,9 @@ then distortion (drive).
                                   │OUT (4x)├──────► out2 (L)
                                   └────────┴──────► out3 (R)
 
-If a MIDI clock is present on TRS or USB MIDI, it is divided by 24 (1PPQN)
-and sent out on output jack 1. STOP/START/CONTINUE is respected. The LED
-will pulse with the clock ONLY if that jack is connected.
+CV outputs out0 / out1 (CV page): LFO (+-5 V), envelope of the last-played voice
+(0..8 V), its gate (0 / 5 V) or its note as 1V/oct pitch (C4 = 0 V). MIDI clock
+is not used.
 
 The following options are tweakable in the menu. Note that the USB/TRS MIDI
 can also be used to control most of these through CCs as follows:
@@ -90,6 +92,9 @@ can also be used to control most of these through CCs as follows:
         VOICE   porta          5  portamento (per-voice glide, 0 = off .. 3 s)
         VOICE   detune        94  unison spread (0 .. +-25 cents)
         VOICE   variance       9  per-voice tolerances (pitch +-3 ct, cutoff +-5 %)
+        VOICE   bend          42  pitch bend range (0 .. 12 semitones)
+        VOICE   bend-vcf      43  pitch bend -> filter cutoff (0 .. +-2 octaves)
+        VOICE   wheel         44  mod wheel -> vibrato depth (Juno-106 LFO lever)
 
         LFO     rate          24  LFO rate (0.05 .. 29.5 Hz)
         LFO     delay         25  LFO fade-in after a new note (0 .. 3.4 s)
@@ -128,8 +133,9 @@ can also be used to control most of these through CCs as follows:
         MISC    save-opts      -  save all options to flash
         MISC    wipe-opts      -  reset all options to defaults
 
-    MIDI CC 1 (mod wheel) opens the filter cutoff. CC 64 (sustain
-    pedal) holds voices. Pitch bend is also supported.
+    MIDI CC 1 (mod wheel) adds vibrato (Juno-106 LFO lever, VOICE `wheel`
+    sensitivity). Pitch bend: range 0..12 semitones (VOICE `bend`), optionally
+    also to the filter (VOICE `bend-vcf`). CC 64 (sustain pedal) holds voices.
 
 """
 
@@ -159,6 +165,7 @@ from juno_voice import MultiADSR, PitchToInc
 from juno_core import JunoCore
 from juno_tracker import JunoVoiceState, JunoVoiceTracker
 from juno_output import knee
+from juno_cv import JunoCvRouter, JunoCvOut
 
 class PolySynth(wiring.Component):
 
@@ -201,6 +208,17 @@ class PolySynth(wiring.Component):
     detune_we: In(1)
     detune_voice: In(3)
     detune_value: In(signed(10))
+    # pitch bend range in semitones (0..12) and the raw bend (for bender -> VCF)
+    bend_range: In(4, init=2)
+    pitch_bend: Out(signed(16))
+    # CV routing (juno_cv): audio-rate pitch / cutoff from a selectable jack
+    # (0 off, 1..4 = jack 0..3, amount SQ(2,14)); CV outputs out0 / out1 sources
+    cv_pitch_src: In(3, init=1)
+    cv_pitch_amt: In(signed(16), init=1 << 14)
+    cv_cutoff_src: In(3, init=2)
+    cv_cutoff_amt: In(signed(16), init=1 << 14)
+    cv_out0_src: In(3)
+    cv_out1_src: In(3)
 
 
     # Jack detection (directly from pmod hardware)
@@ -225,7 +243,12 @@ class PolySynth(wiring.Component):
 
         # Pitch bend range: +-2 semitones (exact, log domain).
         # PitchSQ raw = semitones * 1024; ASQ raw bend = +-32768 -> +-2048 = +-2 semitones.
-        BEND_SHIFT = 4
+        # pitch bend (-1..1, raw +-32768) x range (semitones) -> PitchSQ raw
+        # (1/1024 semitone): bend * range * 1024 / 32768
+        bend_prod = Signal(signed(21))
+        bend_pitch = Signal(signed(17))
+        m.d.sync += bend_prod.eq(voice_tracker.pitch_bend.as_value() * self.bend_range)
+        m.d.comb += bend_pitch.eq(bend_prod >> 5)
 
         # Connect MIDI stream -> voice tracker
         wiring.connect(m, wiring.flipped(self.i_midi), voice_tracker.i)
@@ -239,15 +262,37 @@ class PolySynth(wiring.Component):
         with m.If(self.i.valid):
             m.d.sync += cv.eq(self.i.payload)
 
-        # CV 0: unused for now (phase modulation removed with the wavetable oscillator)
+        # Audio-rate CV routing (pitch, cutoff); other CV targets are applied by
+        # the firmware (fw cv.rs), which reads the jacks through the pmod CSRs.
+        m.submodules.cv_router = cv_router = JunoCvRouter()
+        m.d.comb += [
+            cv_router.cv.eq(cv),
+            cv_router.jack.eq(self.jack[:4]),
+            cv_router.pitch_src.eq(self.cv_pitch_src),
+            cv_router.pitch_amt.eq(self.cv_pitch_amt),
+            cv_router.cutoff_src.eq(self.cv_cutoff_src),
+            cv_router.cutoff_amt.eq(self.cv_cutoff_amt),
+        ]
+        pitch_off = Signal(signed(PitchToInc.PitchSQ.as_shape().width))
+        m.d.comb += pitch_off.eq(bend_pitch + cv_router.pitch)
 
-        # CV 2: drive bipolar offset (when jack 2 patched)
+        # CV outputs (out0 / out1): LFO, envelope / gate / note of the last voice
+        m.submodules.cv_out = cv_out = JunoCvOut()
+        last_voice = voice_tracker.last_voice
+        m.d.comb += [
+            cv_out.src0.eq(self.cv_out0_src),
+            cv_out.src1.eq(self.cv_out1_src),
+            cv_out.lfo.eq(voice_block.lfo),
+            cv_out.env.eq(voice_block.env_tap.as_value()),
+            cv_out.gate.eq(Array(voice_tracker.o[n].gate for n in range(n_voices))[last_voice]),
+            cv_out.note.eq(Array(voice_tracker.o[n].note for n in range(n_voices))[last_voice]),
+            voice_block.env_tap_voice.eq(last_voice),
+        ]
+
+        # output pre-gain (level x drive, juno_output), SQ(3,15)
         SQDrive = dsp.mac.SQNative  # SQ(3, 15)
-        drive_base = Signal(SQDrive)
-        m.d.comb += drive_base.as_value().eq(self.drive << 2)
-        drive_sum = drive_base + cv[2]
         drive_val = Signal(SQDrive)
-        m.d.comb += drive_val.eq(drive_sum.saturate(SQDrive))
+        m.d.comb += drive_val.as_value().eq(Mux(self.drive[15], 0x1FFFF, self.drive << 2))
 
         # per-voice detune (variance + unison spread), latched one voice per write
         for n in range(n_voices):
@@ -279,8 +324,8 @@ class PolySynth(wiring.Component):
         m.d.comb += [
             voice_block.reso.eq(self.reso),
             voice_block.env_amt.eq(self.env_amt),
-            # CV 1: filter cutoff, 1V/oct (when jack 1 patched)
-            voice_block.cutoff_cv.eq(Mux(self.jack[1], cv[1], 0)),
+            # CV -> filter cutoff, 1V/oct (selected jack, juno_cv)
+            voice_block.cutoff_cv.eq(cv_router.cutoff),
             voice_block.attack_rate.eq(self.attack_rate),
             voice_block.decay_rate.eq(self.decay_rate),
             voice_block.sustain_level.eq(self.sustain_level),
@@ -297,7 +342,8 @@ class PolySynth(wiring.Component):
             voice_block.chorus_mode.eq(self.chorus_mode),
             voice_block.lfo_rate_inc.eq(self.lfo_rate_inc),
             voice_block.lfo_delay_step.eq(self.lfo_delay_step),
-            voice_block.pitch_bend.as_value().eq(voice_tracker.pitch_bend.as_value() >> BEND_SHIFT),
+            voice_block.pitch_bend.as_value().eq(pitch_off),
+            self.pitch_bend.eq(voice_tracker.pitch_bend.as_value()),
             voice_block.glide_coef.eq(self.glide_coef),
             voice_tracker.unison.eq(self.unison),
             voice_block.lfo_dco_depth.eq(self.lfo_dco_depth),
@@ -337,7 +383,11 @@ class PolySynth(wiring.Component):
         # Final outputs on channel 2, 3
         m.submodules.merge4 = merge4 = dsp.Merge(
                 n_channels=4, sink=wiring.flipped(self.o))
-        merge4.wire_valid(m, [0, 1])
+        # out0 / out1: CV outputs (always valid, latest value)
+        for ch, v in ((0, cv_out.out0), (1, cv_out.out1)):
+            cv_stream = stream.Signature(ASQ, always_valid=True).create()
+            wiring.connect(m, cv_stream, merge4.i[ch])
+            m.d.comb += cv_stream.payload.eq(v)
         wiring.connect(m, outs[0], merge4.i[2])
         wiring.connect(m, outs[1], merge4.i[3])
 
@@ -390,6 +440,22 @@ class SynthPeripheral(wiring.Component):
         detune: csr.Field(csr.action.W, signed(10))
         voice:  csr.Field(csr.action.W, unsigned(3))
         unison: csr.Field(csr.action.W, unsigned(1))
+        bend_range: csr.Field(csr.action.W, unsigned(4))
+
+    class Bend(csr.Register, access="r"):
+        value: csr.Field(csr.action.R, signed(16))
+
+    class CvRoute(csr.Register, access="w"):
+        # 0 = off, 1..4 = jack 0..3 (pitch / cutoff); CV out sources (juno_cv)
+        pitch_src:  csr.Field(csr.action.W, unsigned(3))
+        cutoff_src: csr.Field(csr.action.W, unsigned(3))
+        out0_src:   csr.Field(csr.action.W, unsigned(3))
+        out1_src:   csr.Field(csr.action.W, unsigned(3))
+
+    class CvAmt(csr.Register, access="w"):
+        # SQ(2,14): 16384 = 1.0 = 1V/oct
+        pitch:  csr.Field(csr.action.W, signed(16))
+        cutoff: csr.Field(csr.action.W, signed(16))
 
     class LfoDepths(csr.Register, access="w"):
         dco: csr.Field(csr.action.W, unsigned(16))
@@ -467,6 +533,9 @@ class SynthPeripheral(wiring.Component):
         self._glide         = regs.add("glide",         self.Glide(),         offset=voices_csr_end + 0x64)
         self._voice_cfg     = regs.add("voice_cfg",     self.VoiceCfg(),      offset=voices_csr_end + 0x68)
         self._out_gain      = regs.add("out_gain",      self.OutGain(),       offset=voices_csr_end + 0x6C)
+        self._bend          = regs.add("bend",          self.Bend(),          offset=voices_csr_end + 0x70)
+        self._cv_route      = regs.add("cv_route",      self.CvRoute(),       offset=voices_csr_end + 0x74)
+        self._cv_amt        = regs.add("cv_amt",        self.CvAmt(),         offset=voices_csr_end + 0x78)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -525,6 +594,7 @@ class SynthPeripheral(wiring.Component):
         with m.If(self._voice_cfg.element.w_stb):
             m.d.sync += [
                 self.synth.unison.eq(self._voice_cfg.f.unison.w_data),
+                self.synth.bend_range.eq(self._voice_cfg.f.bend_range.w_data),
                 self.synth.detune_voice.eq(self._voice_cfg.f.voice.w_data),
                 self.synth.detune_value.eq(self._voice_cfg.f.detune.w_data),
             ]
@@ -548,6 +618,20 @@ class SynthPeripheral(wiring.Component):
             m.d.sync += self.usb_midi_cfg_id.eq(self._midi_cfg.f.value.w_data)
         with m.If(self._midi_endp.f.value.w_stb):
             m.d.sync += self.usb_midi_endpt_id.eq(self._midi_endp.f.value.w_data)
+
+        m.d.comb += self._bend.f.value.r_data.eq(self.synth.pitch_bend)
+        with m.If(self._cv_route.element.w_stb):
+            m.d.sync += [
+                self.synth.cv_pitch_src.eq(self._cv_route.f.pitch_src.w_data),
+                self.synth.cv_cutoff_src.eq(self._cv_route.f.cutoff_src.w_data),
+                self.synth.cv_out0_src.eq(self._cv_route.f.out0_src.w_data),
+                self.synth.cv_out1_src.eq(self._cv_route.f.out1_src.w_data),
+            ]
+        with m.If(self._cv_amt.element.w_stb):
+            m.d.sync += [
+                self.synth.cv_pitch_amt.eq(self._cv_amt.f.pitch.w_data),
+                self.synth.cv_cutoff_amt.eq(self._cv_amt.f.cutoff.w_data),
+            ]
 
         # voice tracking
         for i, voice in enumerate(self._voices):
@@ -640,8 +724,6 @@ class PolySoc(TiliquaSoc):
 
         pmod0 = self.pmod0_periph.pmod
 
-        m.submodules.clock_div = clock_div = midi.MidiClockDivider()
-
         if sim.is_hw(platform):
             # Polysynth hardware MIDI sources
 
@@ -671,14 +753,9 @@ class PolySoc(TiliquaSoc):
                 wiring.connect(m, midi_decode_trs.o, self.synth_periph.i_midi)
                 m.d.comb += vbus_o.eq(0)
 
-            # Route RT messages from the active MIDI source to clock divider.
-            # Drain the inactive source, connect the active one.
-            with m.If(self.synth_periph.usb_midi_host):
-                wiring.connect(m, midi_decode_usb.o_rt, clock_div.i)
-                m.d.comb += midi_decode_trs.o_rt.ready.eq(1)
-            with m.Else():
-                wiring.connect(m, midi_decode_trs.o_rt, clock_div.i)
-                m.d.comb += midi_decode_usb.o_rt.ready.eq(1)
+            # MIDI realtime messages (clock etc.) are not used (Phase 5.3: out1 is
+            # a CV output now); drain both RT streams.
+            m.d.comb += [midi_decode_trs.o_rt.ready.eq(1), midi_decode_usb.o_rt.ready.eq(1)]
 
         # polysynth audio + jack detection
         wiring.connect(m, pmod0.o_cal, polysynth.i)
@@ -686,9 +763,8 @@ class PolySoc(TiliquaSoc):
 
         m.d.comb += [
             pmod0.i_cal.payload[0].eq(polysynth.o.payload[0]),
-            # Channel 1 is MIDI clock square wave (0 / 0.5).
-            pmod0.i_cal.payload[1].eq(
-                Mux(clock_div.o, fixed.Const(0.5, shape=ASQ), 0)),
+            # Channel 0 / 1: CV outputs (juno_cv.JunoCvOut)
+            pmod0.i_cal.payload[1].eq(polysynth.o.payload[1]),
             # Channel 2/3 are stereo outputs
             pmod0.i_cal.payload[2].eq(polysynth.o.payload[2]),
             pmod0.i_cal.payload[3].eq(polysynth.o.payload[3]),

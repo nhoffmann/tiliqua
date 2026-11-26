@@ -61,6 +61,8 @@ class JunoVoiceTracker(wiring.Component):
             "i": In(stream.Signature(MidiMessage)),
             "voice_active": In(data.ArrayLayout(unsigned(1), max_voices)),
             "unison": In(1),
+            # last voice a NOTE_ON was committed to (CV outputs, Phase 5.3)
+            "last_voice": Out(range(max_voices)),
             "o": Out(JunoVoiceState).array(max_voices),
             "pitch_bend": Out(ASQ),
         });
@@ -158,6 +160,7 @@ class JunoVoiceTracker(wiring.Component):
 
             with m.State('NOTE-ON-COMMIT'):
                 # commit the new note to the found slot (unison: to all slots)
+                m.d.sync += self.last_voice.eq(Mux(self.unison, 0, voice_ix_write))
                 for n in range(self.max_voices):
                     with m.If(self.unison | (voice_ix_write == n)):
                         m.d.sync += [

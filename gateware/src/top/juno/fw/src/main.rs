@@ -37,6 +37,8 @@ use tiliqua_fw::lfo;
 use tiliqua_fw::glide;
 use tiliqua_fw::variance;
 use tiliqua_fw::out;
+use tiliqua_fw::cv;
+use tiliqua_hal::pmod::EurorackPmod;
 use tiliqua_fw::vcf;
 use tiliqua_fw::env;
 
@@ -48,7 +50,8 @@ const PERSIST: u8 = 15;
 const PERSIST_HELP: u8 = 64;
 
 // Mod wheel fully up opens the cutoff by 0.5 (5 octaves). Same as sim_render.py.
-const MOD_WHEEL_RANGE: i32 = 16384;
+/// Bender -> VCF at full `bend-vcf`: 2 octaves (normalized octaves raw, 1 oct = 3276.8).
+const BEND_VCF_RANGE: i32 = 6554;
 
 fn tick_handler(app: &Mutex<RefCell<App>>) {
 
@@ -117,8 +120,24 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         // Update synthesizer
         //
 
+        // CV inputs (fw cv.rs): pitch / cutoff routed in gateware at audio rate,
+        // other targets as knob offsets here
+        let cv_targets = [opts.cv.in0.value, opts.cv.in1.value, opts.cv.in2.value, opts.cv.in3.value];
+        let cv_amts = [opts.cv.amt0.value, opts.cv.amt1.value, opts.cv.amt2.value, opts.cv.amt3.value];
+        let cv_samples = app.ui.pmod.sample_i();
+        let cv_jack = app.ui.pmod.jack();
+        let cvk = |knob: u16, t: CvTarget| -> u16 {
+            cv::apply(knob, cv::knob_offset(&cv_targets, &cv_amts, &cv_samples, cv_jack, t))
+        };
+        let (pitch_src, pitch_amt) = cv::fast_route(&cv_targets, &cv_amts, CvTarget::Pitch);
+        let (cutoff_src, cutoff_amt) = cv::fast_route(&cv_targets, &cv_amts, CvTarget::Cutoff);
+        app.synth.set_cv_route(pitch_src, cutoff_src,
+                               opts.cv.out0.value as u8, opts.cv.out1.value as u8);
+        app.synth.set_cv_amt(pitch_amt, cutoff_amt);
+
         // Output stage: level x drive pre-gain, drive-compensating post-gain
-        let (pre, post) = out::registers(opts.effect.level.value, opts.effect.drive.value);
+        let (pre, post) = out::registers(cvk(opts.effect.level.value, CvTarget::Level),
+                                         cvk(opts.effect.drive.value, CvTarget::Drive));
         let pre = app.drive_smoother.proc_u16(pre);
         let post = app.out_gain_smoother.proc_u16(post);
         app.synth.set_drive(pre);
@@ -126,7 +145,7 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
 
         // Map 0-1 UI range to 32768-8192 hardware range (inverted)
         // Ladder resonance: knob -> KR-106-calibrated curve (gateware: k = 4.5 res)
-        let reso_smooth = app.reso_smoother.proc_u16(vcf::res_knob_to_reg(opts.vcf.reso.value));
+        let reso_smooth = app.reso_smoother.proc_u16(vcf::res_knob_to_reg(cvk(opts.vcf.reso.value, CvTarget::Reso)));
         app.synth.set_reso(reso_smooth);
 
         app.synth.set_fx(opts.vcf.hpf.value as u8, opts.effect.chorus.value as u8);
@@ -137,16 +156,18 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
         {
             let cutoff = vcf::cutoff_knob_to_c(app.cutoff_smoother.proc_u16(opts.vcf.cutoff.value));
             let kbd = i32::from(opts.vcf.kbd_track.value);
-            let mod_off = i32::from(app.mod_wheel) * MOD_WHEEL_RANGE / 127;
+            // bender -> VCF (Juno-106 bender VCF sensitivity)
+            let bend = i32::from(app.synth.pitch_bend());
+            let bend_off = ((bend * i32::from(opts.voice.bend_vcf.value)) >> 15) * BEND_VCF_RANGE >> 15;
             let notes = app.synth.voice_notes();
             for (voice, note) in notes.iter().enumerate() {
                 // kbd * (note - C1) / 12 octaves, 1 octave = 1/10 = 3276.8 raw
                 let track = kbd * (i32::from(*note) - vcf::KBD_REF_NOTE) / 120;
                 let var = variance::cutoff_raw(voice, opts.voice.variance.value);
-                let base = (cutoff + track + mod_off + var).clamp(-32768, 32767);
+                let base = (cutoff + track + bend_off + var).clamp(-32768, 32767);
                 app.synth.set_cutoff_base(voice, base as i16);
             }
-            let amt = i32::from(opts.vcf.env_amt.value).min(32767);
+            let amt = i32::from(cvk(opts.vcf.env_amt.value, CvTarget::EnvAmt)).min(32767);
             let amt = match opts.vcf.env_pol.value {
                 EnvPolarity::Pos => amt,
                 EnvPolarity::Neg => -amt,
@@ -174,36 +195,43 @@ fn tick_handler(app: &Mutex<RefCell<App>>) {
                           opts.dco.pwm_mode.value == PwmMode::Lfo,
                           opts.adsr.vca_mode.value == VcaMode::Gate,
                           opts.dco.range.value as u8);
-        app.synth.set_pw_knob(opts.dco.pw.value);
+        app.synth.set_pw_knob(cvk(opts.dco.pw.value, CvTarget::Pw));
         app.synth.set_mix_levels(dco::sub_gain(opts.dco.sub.value),
                                  dco::level_gain(opts.dco.noise.value));
 
         // Key assign + per-voice detune (variance, unison spread): only on change
         let unison = opts.voice.assign.value == AssignMode::Unison;
-        let voice_knobs = (unison, opts.voice.detune.value, opts.voice.variance.value);
+        let voice_knobs = (unison, opts.voice.detune.value, opts.voice.variance.value,
+                           opts.voice.bend.value as u8);
         if app.last_voice_knobs != Some(voice_knobs) {
             app.last_voice_knobs = Some(voice_knobs);
             for voice in 0..N_VOICES {
                 let d = variance::detune_raw(voice, voice_knobs.2, unison, voice_knobs.1);
-                app.synth.set_voice_cfg(voice, d, unison);
+                app.synth.set_voice_cfg(voice, d, unison, voice_knobs.3);
             }
         }
 
         // Portamento (float conversion only when the knob moves)
-        if app.last_porta != Some(opts.voice.porta.value) {
-            app.last_porta = Some(opts.voice.porta.value);
-            app.synth.set_glide(glide::coef(opts.voice.porta.value));
+        let porta = cvk(opts.voice.porta.value, CvTarget::Porta);
+        if app.last_porta != Some(porta) {
+            app.last_porta = Some(porta);
+            app.synth.set_glide(glide::coef(porta));
         }
 
         // LFO (float conversions only when a knob moves)
-        let lfo_knobs = (opts.lfo.rate.value, opts.lfo.delay.value,
-                         opts.dco.lfo.value, opts.vcf.lfo.value);
+        let lfo_knobs = (cvk(opts.lfo.rate.value, CvTarget::LfoRate), opts.lfo.delay.value,
+                         cvk(opts.dco.lfo.value, CvTarget::Vibrato),
+                         cvk(opts.vcf.lfo.value, CvTarget::VcfLfo),
+                         opts.voice.wheel.value, app.mod_wheel);
         if app.last_lfo_knobs != Some(lfo_knobs) {
             app.last_lfo_knobs = Some(lfo_knobs);
-            app.synth.set_lfo_rate(lfo::rate_inc(opts.lfo.rate.value));
-            app.synth.set_lfo_delay(lfo::delay_step(opts.lfo.delay.value));
-            app.synth.set_lfo_depths(lfo::dco_depth(opts.dco.lfo.value),
-                                     lfo::vcf_depth(opts.vcf.lfo.value));
+            app.synth.set_lfo_rate(lfo::rate_inc(lfo_knobs.0));
+            app.synth.set_lfo_delay(lfo::delay_step(lfo_knobs.1));
+            // mod wheel = Juno-106 LFO lever: adds vibrato on top of the DCO LFO knob
+            let wheel = u32::from(lfo::dco_depth(opts.voice.wheel.value))
+                        * u32::from(app.mod_wheel) / 127;
+            let dco = (u32::from(lfo::dco_depth(lfo_knobs.2)) + wheel).min(65535) as u16;
+            app.synth.set_lfo_depths(dco, lfo::vcf_depth(lfo_knobs.3));
         }
     });
 }
@@ -230,6 +258,9 @@ fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
     m.add(14, global_index(opts, &opts.voice.assign),    CcMapMode::Absolute);
     m.add(94, global_index(opts, &opts.voice.detune),    CcMapMode::Absolute);
     m.add(9,  global_index(opts, &opts.voice.variance),  CcMapMode::Absolute);
+    m.add(42, global_index(opts, &opts.voice.bend),      CcMapMode::Absolute);
+    m.add(43, global_index(opts, &opts.voice.bend_vcf),  CcMapMode::Absolute);
+    m.add(44, global_index(opts, &opts.voice.wheel),     CcMapMode::Absolute);
     // LFO page (CC 24-25)
     m.add(24, global_index(opts, &opts.lfo.rate),        CcMapMode::Absolute);
     m.add(25, global_index(opts, &opts.lfo.delay),       CcMapMode::Absolute);
@@ -279,11 +310,11 @@ struct App {
     // last envelope knobs written (attack, decay, release)
     last_env_knobs: Option<(u16, u16, u16)>,
     // last LFO knobs written (rate, delay, dco depth, vcf depth)
-    last_lfo_knobs: Option<(u16, u16, u16, u16)>,
+    last_lfo_knobs: Option<(u16, u16, u16, u16, u16, u8)>,
     // last portamento knob written
     last_porta: Option<u16>,
     // last key assign / detune / variance written
-    last_voice_knobs: Option<(bool, u16, u16)>,
+    last_voice_knobs: Option<(bool, u16, u16, u8)>,
     // midi cc mapper
     cc_mapper: MidiCcMapper,
 }

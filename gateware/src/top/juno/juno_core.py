@@ -88,6 +88,9 @@ class JunoCore(wiring.Component):
             "voice_active":  Out(data.ArrayLayout(unsigned(1), n)),
             "voice_cutoffs": Out(data.ArrayLayout(unsigned(8), n)),
             "lfo":           Out(signed(16)),
+            # envelope of one voice (CV out)
+            "env_tap_voice": In(range(n)),
+            "env_tap":       Out(MultiADSR.EnvUQ),
         })
 
     def elaborate(self, platform):
@@ -152,6 +155,8 @@ class JunoCore(wiring.Component):
             voice.decay_rate.eq(self.decay_rate),
             voice.sustain_level.eq(self.sustain_level),
             voice.release_rate.eq(self.release_rate),
+            voice.env_tap_voice.eq(self.env_tap_voice),
+            self.env_tap.eq(voice.env_tap),
         ]
         wiring.connect(m, voice.o, fx.i)
         wiring.connect(m, fx.o, wiring.flipped(self.o))

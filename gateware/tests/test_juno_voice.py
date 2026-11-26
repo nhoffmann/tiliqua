@@ -30,6 +30,8 @@ from top.juno.juno_fx import JunoFx
 from top.juno.juno_glide import GlideModel, JunoGlide, glide_coef, glide_time
 from top.juno.juno_tracker import JunoVoiceTracker
 from top.juno import juno_output as out_stage
+from top.juno.juno_cv import (JunoCvRouter, JunoCvOut, pitch_from_cv, cutoff_from_cv,
+                              cv_out_model, OUT_PITCH, OUT_LFO)
 from tiliqua.midi.types import Status
 from tiliqua.test import stream
 from top.juno.sim_render import FS, Note, Params, pw_knob_to_point
@@ -603,6 +605,91 @@ class JunoVoiceTests(unittest.TestCase):
         self.assertLess(np.abs(o1).max(), out_stage.KNEE)
         od = out_stage.output(chord, drive_knob=1.0)
         self.assertLess(abs(20 * np.log10(rms(od) / rms(o6))), 4.0)
+
+    def test_cv_router_matches_model(self):
+        """Pitch / cutoff CV routing: jack select, jack-detect gating, amount,
+        1V/oct scaling (4000 counts -> 12 semitones), cutoff saturation."""
+        rng = random.Random(7)
+        dut = JunoCvRouter()
+        errs = []
+
+        async def testbench(ctx):
+            for _ in range(300):
+                cv = [rng.randrange(-32768, 32768) for _ in range(4)]
+                jack = rng.randrange(16)
+                ps, cs = rng.randrange(5), rng.randrange(5)
+                pa, ca = rng.choice([16384, -16384, 8192, 32767, -32768, 0, rng.randrange(-32768, 32768)]), \
+                         rng.choice([16384, 32767, rng.randrange(-32768, 32768)])
+                for j in range(4):
+                    ctx.set(dut.cv[j].as_value(), cv[j])
+                ctx.set(dut.jack, jack)
+                ctx.set(dut.pitch_src, ps); ctx.set(dut.pitch_amt, pa)
+                ctx.set(dut.cutoff_src, cs); ctx.set(dut.cutoff_amt, ca)
+                await ctx.tick().repeat(3)
+                sel = lambda src: cv[src - 1] if src and (jack >> (src - 1)) & 1 else 0
+                exp = (pitch_from_cv(sel(ps), pa), cutoff_from_cv(sel(cs), ca))
+                got = (ctx.get(dut.pitch), ctx.get(dut.cutoff.as_value()))
+                if got != exp:
+                    errs.append((cv, jack, ps, pa, cs, ca, got, exp))
+
+        sim = Simulator(dut)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+        self.assertEqual(errs[:3], [])
+        # 1 V (4000 counts) at amount 1.0 = 12 semitones within 0.02 cents
+        self.assertLess(abs(pitch_from_cv(4000, 16384) / 1024 - 12) * 100, 0.02 * 1)
+
+    def test_cv_out_matches_model(self):
+        """CV outputs: every source on both outputs, LFO / env / gate / pitch scaling."""
+        rng = random.Random(8)
+        dut = JunoCvOut()
+        errs = []
+
+        async def testbench(ctx):
+            for _ in range(200):
+                v = dict(lfo=rng.randrange(-32768, 32768), env=rng.randrange(65536),
+                         gate=rng.randrange(2), note=rng.randrange(128))
+                s0, s1 = rng.randrange(8), rng.randrange(8)
+                for k, x in v.items():
+                    ctx.set(getattr(dut, k), x)
+                ctx.set(dut.src0, s0); ctx.set(dut.src1, s1)
+                await ctx.tick().repeat(2)
+                got = (ctx.get(dut.out0.as_value()), ctx.get(dut.out1.as_value()))
+                exp = (cv_out_model(s0, **v), cv_out_model(s1, **v))
+                if got != exp:
+                    errs.append((v, s0, s1, got, exp))
+
+        sim = Simulator(dut)
+        sim.add_clock(1 / 60e6)
+        sim.add_testbench(testbench)
+        sim.run()
+        self.assertEqual(errs[:3], [])
+        # scaling: pitch 1 V/oct (C5 = +4000 counts within 1), LFO full = +-5 V
+        self.assertLessEqual(abs(cv_out_model(OUT_PITCH, 0, 0, 0, 72) - 4000), 1)
+        self.assertLess(abs(cv_out_model(OUT_LFO, 32767, 0, 0, 0) - 20000), 60)
+
+    def test_tracker_last_voice(self):
+        """last_voice follows the voice of the latest NOTE_ON (0 in unison)."""
+        dut = JunoVoiceTracker(max_voices=6)
+        got = []
+
+        def msg(note):
+            return {'status': {'kind': Status.Kind.NOTE_ON, 'nibble': {'channel': 0}},
+                    'midi_payload': {'note_on': {'note': note, 'velocity': 0x60}}}
+
+        async def testbench(ctx):
+            for note in (60, 64, 67):
+                await stream.put(ctx, dut.i, msg(note))
+                await ctx.tick().repeat(40)
+                lv = ctx.get(dut.last_voice)
+                got.append((ctx.get(dut.o[lv].note), ctx.get(dut.o[lv].gate)))
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench)
+        sim.run()
+        self.assertEqual(got, [(60, 1), (64, 1), (67, 1)])
 
     def test_pitch_full_range(self):
         """Pitch within 2 cents from C1 to C7 (catches coarse bass tuning: the

@@ -43,17 +43,19 @@ N_VOICES = 6
 EnvUQ = MultiADSR.EnvUQ
 
 
-def cutoff_base(cutoff, kbd, note, mod_wheel=0.0):
+def cutoff_base(cutoff, kbd, note, bend_vcf=0.0):
     """Per-voice cutoff base, same formula as the firmware (normalized octaves):
-    cutoff + keyboard tracking relative to C1 (note 24, KR-106) + mod wheel offset.
+    cutoff + keyboard tracking relative to C1 (note 24, KR-106) + bender -> VCF
+    (``bend_vcf`` = bend x sensitivity, -1..1 = +-2 octaves; fw main.rs).
     ``cutoff`` is the internal c (0..1 = 20 Hz .. 20.5 kHz); the firmware gets it
     from the knob via ``ladder_model.cutoff_knob_to_c`` (Juno-106 slider curve)."""
     octave = 1.0 / MultiLadder.CUTOFF_OCTAVES
-    return cutoff + kbd * (note - KBD_REF_NOTE) / 12 * octave + mod_wheel * MOD_WHEEL_RANGE
+    return cutoff + kbd * (note - KBD_REF_NOTE) / 12 * octave + bend_vcf * BEND_VCF_RANGE
 
 
-# Mod wheel fully up opens the cutoff by this much (normalized octaves).
-MOD_WHEEL_RANGE = 0.5
+# Bender -> VCF at full bend and sensitivity: 2 octaves (normalized octaves).
+# (Phase 5.1: the mod wheel now adds vibrato instead of opening the cutoff.)
+BEND_VCF_RANGE = 0.2
 
 
 @dataclass
@@ -79,7 +81,7 @@ class Params:
     cutoff:  float = 0.35
     env_amt: float = 0.6
     kbd:     float = 0.5
-    mod_wheel: float = 0.0
+    bend_vcf: float = 0.0          # bender -> VCF (bend x sensitivity, -1..1 = +-2 oct)
     bend_semitones: float = 0.0    # pitch bend applied to all notes (top.py: +-2 range)
     portamento: float = 0.0        # glide time constant in seconds (0 = off, juno_glide)
     detune_cents: tuple = ()       # extra per-voice pitch offsets in cents
@@ -177,7 +179,7 @@ def prepare(notes, seconds, params=None):
     }
     events = []
     for n in notes:
-        base = (cutoff_base(params.cutoff, params.kbd, n.note, params.mod_wheel)
+        base = (cutoff_base(params.cutoff, params.kbd, n.note, params.bend_vcf)
                 + variance_cutoff(params, n.voice))
         on = (int(n.on_s * FS), n.voice, 1,
               _raw(n.note, PitchToInc.PitchSQ),
